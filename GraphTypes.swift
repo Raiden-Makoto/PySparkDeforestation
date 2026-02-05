@@ -12,10 +12,8 @@ import Foundation
 
 // matches the [x, y, z, atom_type] 16-byte packing
 struct Node{
-    let x: Float
-    let y: Float
-    let z: Float
-    let atomType: Float
+    var pos: SIMD3<Float>
+    var atomType: Float
 }
 
 // matches the [row, col] 8-byte packing
