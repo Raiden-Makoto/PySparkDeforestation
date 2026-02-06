@@ -18,6 +18,19 @@ func XavierInit(_ buffer: MTLBuffer, count: Int, fanIn: Int, fanOut: Int) {
     }
 }
 
+func TimestepEmbedding(t: Float, dim: Int) -> [Float]{
+    var embedding = [Float](repeating: 0, count: dim)
+    let halfDim = dim / 2
+    let exponent = log(10000.0) / Double(halfDim - 1)
+    for i in 0..<halfDim {
+        let freq = exp(-exponent * Double(i))
+        let arg = Double(t) * freq
+        embedding[i] = Float(sin(arg))
+        embedding[i + halfDim] = Float(cos(arg))
+    }
+    return embedding
+}
+
 guard let device = MTLCreateSystemDefaultDevice() else {
     fatalError("Metal is not supported on this device!")
 }
