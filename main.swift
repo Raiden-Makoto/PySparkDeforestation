@@ -36,10 +36,11 @@ do {
         let sample = metaPtr.pointee
         print("Data Load Success:")
         print("Total Molecules Loaded: \(loader.graphCount)")
-        //print("Sample Molecule Stats")
-        //print(" - Node Data: \(sample.nodeStart)")
-        //print(" - Atom Count: \(sample.nodeCount)")
-        //print(" - Edge Count: \(sample.edgeCount)")
+        print("Sample Molecule Stats")
+        print(" - Node Data: \(sample.nodeStart)")
+        print(" - Atom Count: \(sample.nodeCount)")
+        print(" - Edge Count: \(sample.edgeCount)")
+        print("----------------------------------")
     }
 }
 catch {
@@ -108,14 +109,32 @@ let gridSize = MTLSize(width: activeEdgeCount, height: 1, depth: 1)
 let threadgroupSize = MTLSize(width: min(activeEdgeCount, pipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
 
 encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+encoder.endEncoding()
+
+// perform aggregation
+let aggBuffer = device.makeBuffer(length: activeNodeCount * hiddenDim * MemoryLayout<Float>.size, options: .storageModeShared)!
+memset(aggBuffer.contents(), 0, aggBuffer.length); // ensure it starts a zero
+let aggFunction = lib.makeFunction(name: "aggregate_message")!
+let aggPipeline = try! device.makeComputePipelineState(function: aggFunction)
+
+let aggEncoder = commandBuffer.makeComputeCommandEncoder()!
+aggEncoder.setComputePipelineState(aggPipeline)
+
+aggEncoder.setBuffer(msgBuffer, offset: 0, index: 0)
+aggEncoder.setBuffer(loader.edgeBuffer, offset: 0, index: 1)
+aggEncoder.setBuffer(aggBuffer, offset: 0, index: 2)
+var hDimAgg = UInt32(hiddenDim)
+aggEncoder.setBytes(&hDimAgg, length: MemoryLayout<UInt32>.size, index: 3)
+
+let aggGridSize = MTLSize(width: activeEdgeCount, height: 1, depth: 1)
+aggEncoder.dispatchThreads(aggGridSize, threadsPerThreadgroup: threadgroupSize)
+aggEncoder.endEncoding()
 
 // Finalize and Submit
-encoder.endEncoding()
 commandBuffer.commit()
 commandBuffer.waitUntilCompleted() // Wait for GPU to finish
 // Normally we chain multiple encoders but this is for debugging only
 
 // Check Output
-let msgPtr = msgBuffer.contents().bindMemory(to: Float.self, capacity: hiddenDim)
-print("GPU Verification")
-print("First message value (Index 0): \(msgPtr[0])")
+let aggPtr = aggBuffer.contents().bindMemory(to: Float.self, capacity: hiddenDim)
+print("Aggregated feature for Node 0 (Index 0): \(aggPtr[0])")

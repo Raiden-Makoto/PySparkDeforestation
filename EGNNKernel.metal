@@ -6,6 +6,7 @@
 //
 
 #include <metal_stdlib>
+#include <metal_atomic>
 using namespace metal;
 
 // Metal cannot see Swift structs
@@ -54,3 +55,20 @@ kernel void compute_message(
     }
 }
 
+kernel void aggregate_message(
+    device const float* messages [[buffer(0)]],
+    device const int2* edge_index [[buffer(1)]],
+    device atomic_float* node_agg_out [[buffer(2)]],
+    constant uint& hidden_dim [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+){
+    int target_node = edge_index[gid].y;
+    for (uint h = 0; h < hidden_dim; h++){
+        float msg = messages[gid * hidden_dim + h];
+        atomic_fetch_add_explicit(
+            &node_agg_out[target_node * hidden_dim + h],
+            msg,
+            memory_order_relaxed
+        );
+    }
+}
