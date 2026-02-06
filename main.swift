@@ -82,6 +82,10 @@ let posUpdateBuffer = device.makeBuffer(length: activeNodeCount * 3 * MemoryLayo
 let nodeWBuffer = device.makeBuffer(length: hiddenDim * (2 * hiddenDim) * MemoryLayout<Float>.size, options: .storageModeShared)!
 let nodeBBuffer = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.size, options: .storageModeShared)!
 
+// 5. Normalization Buffers
+let cogSumBuffer = device.makeBuffer(length: 3 * MemoryLayout<Float>.size, options: .storageModeShared)!
+memset(cogSumBuffer.contents(), 0, cogSumBuffer.length)
+
 // --- WEIGHT INITIALIZATION ---
 
 XavierInit(embedTableBuffer, count: 10 * hiddenDim, fanIn: 10, fanOut: hiddenDim)
@@ -100,6 +104,8 @@ let msgPipeline = try device.makeComputePipelineState(function: lib.makeFunction
 let aggPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "aggregate_message")!)
 let coordPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "update_coords")!)
 let applyPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "apply_updates")!)
+let cogPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "compute_cog")!)
+let normPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "apply_cog_normalization")!)
 
 // --- EXECUTION LOOP ---
 
@@ -182,6 +188,34 @@ for _ in 0..<4 {
     applyEncoder.setBytes(&hDimVal, length: MemoryLayout<UInt32>.size, index: 6)
     applyEncoder.dispatchThreads(MTLSize(width: activeNodeCount, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     applyEncoder.endEncoding()
+    
+    // E: CENTER OF GRAVITY NORMALIZATION
+    // 1. Clear the Cog Sum
+    let blitCog = commandBuffer.makeBlitCommandEncoder()!
+    blitCog.fill(buffer: cogSumBuffer, range: 0..<cogSumBuffer.length, value: 0)
+    blitCog.endEncoding()
+
+    // 2. Compute the center (Atomic sum into cogSumBuffer)
+    let cogEncoder = commandBuffer.makeComputeCommandEncoder()!
+    cogEncoder.setComputePipelineState(cogPipeline)
+    cogEncoder.setBuffer(loader.nodeBuffer, offset: 0, index: 0)
+    cogEncoder.setBuffer(cogSumBuffer, offset: 0, index: 1)
+    cogEncoder.dispatchThreads(MTLSize(width: activeNodeCount, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    cogEncoder.endEncoding()
+
+    // 3. Subtract the Center (GPU-Side)
+    // Note: To keep this 100% GPU-sync, we pass the atom count as a constant
+    // and the kernel handles the division.
+    let normEncoder = commandBuffer.makeComputeCommandEncoder()!
+    normEncoder.setComputePipelineState(normPipeline)
+    normEncoder.setBuffer(loader.nodeBuffer, offset: 0, index: 0)
+    normEncoder.setBuffer(cogSumBuffer, offset: 0, index: 1)
+    var nodeCountU32 = UInt32(activeNodeCount)
+    normEncoder.setBytes(&nodeCountU32, length: MemoryLayout<UInt32>.size, index: 2)
+    normEncoder.dispatchThreads(MTLSize(width: activeNodeCount, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    normEncoder.endEncoding()
 }
 
 commandBuffer.commit()
