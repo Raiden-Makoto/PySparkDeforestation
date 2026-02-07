@@ -122,26 +122,36 @@ kernel void backward_coordinate(
     device const float* coord_weights   [[buffer(1)]], // coordWeightBuffer [H]
     device const float* msg_inputs      [[buffer(2)]], // msgBuffer [E*H]
     device const int2* edge_index       [[buffer(3)]], // From edges.bin
-    device float* grad_coord_w_out      [[buffer(4)]], // OUTPUT: weight grads
-    device float* grad_msg_out          [[buffer(5)]], // OUTPUT: dL/dmsg
-    constant uint& hidden_dim           [[buffer(6)]],
-    uint gid [[thread_position_in_grid]]) // Thread per edge
+    device const float* pos             [[buffer(4)]], // INPUT: Forward pass positions (posT/posV)
+    device float* grad_coord_w_out      [[buffer(5)]], // OUTPUT: weight grads
+    device float* grad_msg_out          [[buffer(6)]], // OUTPUT: dL/dmsg
+    constant uint& hidden_dim           [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
 {
     int idx = edge_index[gid].x;
-    int jdx = edge_index[gid].y;
+    int jdx = edge_index[gid].y; // Now used to fetch neighbor position
+
+    // 1. Fetch relevant vectors
+    float3 p_i = float3(pos[idx * 3], pos[idx * 3 + 1], pos[idx * 3 + 2]);
+    float3 p_j = float3(pos[jdx * 3], pos[jdx * 3 + 1], pos[jdx * 3 + 2]);
+    float3 d_pos_error = float3(grad_pos_next[idx * 3], grad_pos_next[idx * 3 + 1], grad_pos_next[idx * 3 + 2]);
+    
+    // 2. Relative displacement vector from forward pass
+    float3 rij = p_i - p_j;
+    
+    // 3. Chain rule: dot product of error vector and displacement vector
+    // This provides the scalar "force" applied to the weights
+    float gradient_scalar = dot(d_pos_error, rij);
 
     for (uint h = 0; h < hidden_dim; h++) {
         float m_h = msg_inputs[gid * hidden_dim + h];
         float w_h = coord_weights[h];
         
-        // Error from the node's position change
-        float3 d_pos = float3(grad_pos_next[idx * 3], grad_pos_next[idx * 3 + 1], grad_pos_next[idx * 3 + 2]);
+        // Correct Weight Gradient: dL/dW = (dL/dpos · rij) * message_h
+        atomic_fetch_add_explicit((device atomic_float*)&grad_coord_w_out[h], gradient_scalar * m_h, memory_order_relaxed);
         
-        // Weight Gradient: dL/dW = dL/dpos * m_h
-        atomic_fetch_add_explicit((device atomic_float*)&grad_coord_w_out[h], dot(d_pos, d_pos) * m_h, memory_order_relaxed);
-        
-        // Propagate to message: dL/dm = dL/dpos * w_h
-        grad_msg_out[gid * hidden_dim + h] += dot(d_pos, d_pos) * w_h;
+        // Correct Message Gradient: dL/dm = (dL/dpos · rij) * weight_h
+        grad_msg_out[gid * hidden_dim + h] += gradient_scalar * w_h;
     }
 }
 
@@ -173,3 +183,37 @@ kernel void apply_adam_update(
     weights[gid] -= lr * m_hat / (sqrt(v_hat) + epsilon);
 }
 
+kernel void compute_mse_gradient(
+    device const float* pos     [[buffer(0)]],
+    device const float* target  [[buffer(1)]],
+    device float* grad_pos      [[buffer(2)]],
+    constant uint& count        [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= count) return;
+    // d/dx (x - y)^2 = 2 * (x - y)
+    grad_pos[gid] = 2.0f * (pos[gid] - target[gid]);
+}
+
+kernel void accumulate_node_gradients(
+    device const float* grad_msg_input   [[buffer(0)]], // dL/d(concat[hi, hj, d2])
+    device const int2* edge_index        [[buffer(1)]],
+    device float* grad_h_out             [[buffer(2)]], // OUTPUT: dL/dh (Hidden state gradient)
+    constant uint& hidden_dim            [[buffer(3)]],
+    constant uint& edge_count            [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= edge_count) return;
+    int idx = edge_index[gid].x;
+    int jdx = edge_index[gid].y;
+
+    for (uint h = 0; h < hidden_dim; h++) {
+        // Gradient for source node hi is the first hiddenDim values
+        float g_hi = grad_msg_input[gid * (2 * hidden_dim + 1) + h];
+        // Gradient for target node hj is the next hiddenDim values
+        float g_hj = grad_msg_input[gid * (2 * hidden_dim + 1) + hidden_dim + h];
+
+        atomic_fetch_add_explicit((device atomic_float*)&grad_h_out[idx * hidden_dim + h], g_hi, memory_order_relaxed);
+        atomic_fetch_add_explicit((device atomic_float*)&grad_h_out[jdx * hidden_dim + h], g_hj, memory_order_relaxed);
+    }
+}
