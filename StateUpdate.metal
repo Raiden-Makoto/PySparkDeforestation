@@ -15,28 +15,38 @@ inline float silu(float x){
 
 
 kernel void apply_updates(
-    device Node* nodes              [[buffer(0)]], // Mutable positions
-  device float* h                 [[buffer(1)]], // Mutable features
-  device const float* pos_delta   [[buffer(2)]], // From update_coords
-  device const float* h_agg       [[buffer(3)]], // Aggregated messages
-  device const float* node_w      [[buffer(4)]], // Node MLP Weights [H, 2H]
-  device const float* node_b      [[buffer(5)]], // Node MLP Bias [H]
-  constant uint& hidden_dim       [[buffer(6)]],
-  uint gid [[thread_position_in_grid]]){
-        float scale = 0.01f;
-        // 1. Move Atoms
-        nodes[gid].pos += float3(pos_delta[gid*3], pos_delta[gid*3+1], pos_delta[gid*3+2]) * scale;
-        // 2. Node MLP
-        // We concatenate h and h_agg virtually here
-        for (uint row = 0; row < hidden_dim; row++) {
-                        float activation = node_b[row];
-                        for (uint col = 0; col < 2 * hidden_dim; col++) {
-                                        float val = (col < hidden_dim) ? h[gid * hidden_dim + col] : h_agg[gid * hidden_dim + (col - hidden_dim)];
-                                        activation += val * node_w[row * (2 * hidden_dim) + col];
-                        }
-                        // 3. Final Residual Update: h = h + SiLU(MLP(h, m_agg))
-                        h[gid * hidden_dim + row] += silu(activation);
+    device Node* nodes              [[buffer(0)]],
+    device float* h                 [[buffer(1)]],
+    device const float* pos_delta   [[buffer(2)]],
+    device const float* h_agg       [[buffer(3)]],
+    device const float* node_w      [[buffer(4)]],
+    device const float* node_b      [[buffer(5)]],
+    constant uint& hidden_dim       [[buffer(6)]],
+    device float* node_inputs_out   [[buffer(7)]], // New: Save for backprop
+    device float* node_z_out        [[buffer(8)]], // New: Save for backprop
+    uint gid [[thread_position_in_grid]]
+){
+    float coord_scale = 0.01f;
+    nodes[gid].pos += float3(pos_delta[gid*3], pos_delta[gid*3+1], pos_delta[gid*3+2]) * coord_scale;
+
+    for (uint row = 0; row < hidden_dim; row++) {
+        float activation = node_b[row];
+        
+        // Save inputs once per node
+        if (row == 0) {
+            for (uint i = 0; i < 2 * hidden_dim; i++) {
+                node_inputs_out[gid * 2 * hidden_dim + i] = (i < hidden_dim) ? h[gid * hidden_dim + i] : h_agg[gid * hidden_dim + (i - hidden_dim)];
+            }
         }
+
+        for (uint col = 0; col < 2 * hidden_dim; col++) {
+            float val = node_inputs_out[gid * 2 * hidden_dim + col];
+            activation += val * node_w[row * (2 * hidden_dim) + col];
+        }
+        
+        node_z_out[gid * hidden_dim + row] = activation; // Save Z
+        h[gid * hidden_dim + row] += (activation / (1.0f + exp(-activation))) * 0.1f;
+    }
 }
 
 kernel void compute_cog(

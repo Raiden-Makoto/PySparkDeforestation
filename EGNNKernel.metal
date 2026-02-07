@@ -15,42 +15,48 @@ inline float silu(float x){
 }
 
 kernel void compute_message(
-    device const Node* nodes [[buffer(0)]], // from nodes.bin
-    device const float* h [[buffer(1)]], // node features (hidden_dim)
-    device const int2* edge_index [[buffer(2)]], // from edges.bin
-    device const float* weights_l1 [[buffer(3)]], // [hidden_dim, hidden_dim*2+1]
-    device const float* bias_l1 [[buffer(4)]], // [hidden_dim]
-    device float* message_out [[buffer(5)]], // num_edges * hidden_dim
+    device const Node* nodes [[buffer(0)]],
+    device const float* h [[buffer(1)]],
+    device const int2* edge_index [[buffer(2)]],
+    device const float* weights_l1 [[buffer(3)]],
+    device const float* bias_l1 [[buffer(4)]],
+    device float* message_out [[buffer(5)]],
     constant uint& hidden_dim [[buffer(6)]],
+    device float* inputs_out     [[buffer(7)]],
+    device float* pre_activ_out  [[buffer(8)]],
     uint gid [[thread_position_in_grid]]
 ){
     int idx = edge_index[gid].x;
     int jdx = edge_index[gid].y;
-    // compute radial distances (equivariant feature)
-    float3 pos_i = nodes[idx].pos;
-    float3 pos_j = nodes[jdx].pos;
-    float3 diff = pos_i - pos_j;
-    float dist_sq = dot(diff, diff) + 1e-8f;
-    float dist = sqrt(dist_sq);
-    // Normalization: This ensures the MLP input doesn't explode
+    
+    float3 diff = nodes[idx].pos - nodes[jdx].pos;
+    float dist = sqrt(dot(diff, diff) + 1e-8f);
     float radial = 1.0f / (1.0f + dist);
     
-    // Linear Layer 1
     uint input_dim = 2 * hidden_dim + 1;
+
+    // --- SAVE INPUTS FOR BACKPROP ---
+    // We save h_i, h_j, and radial so backward_message can use them
+    for (uint i = 0; i < input_dim; i++) {
+        float val;
+        if (i < hidden_dim) val = h[idx * hidden_dim + i];
+        else if (i < 2 * hidden_dim) val = h[jdx * hidden_dim + (i - hidden_dim)];
+        else val = radial;
+        inputs_out[gid * input_dim + i] = val;
+    }
+
+    // --- FORWARD PASS ---
     for (uint row = 0; row < hidden_dim; row++){
         float accumulated = bias_l1[row];
         for (uint col = 0; col < input_dim; col++){
-            float val;
-            if (col < hidden_dim){
-                val = h[idx *  hidden_dim + col];
-            } else if (col < 2 * hidden_dim){
-                val = h[jdx * hidden_dim + (col - hidden_dim)];
-            } else {
-                val = radial;
-            }
+            // Use the already-saved inputs to ensure forward/backward consistency
+            float val = inputs_out[gid * input_dim + col];
             accumulated += val * weights_l1[row * input_dim + col];
         }
-        message_out[gid * hidden_dim + row] = silu(accumulated);
+        
+        // Use 'row' instead of 'h' and 'accumulated' instead of 'activation'
+        pre_activ_out[gid * hidden_dim + row] = accumulated;
+        message_out[gid * hidden_dim + row] = accumulated / (1.0f + exp(-accumulated)); // Manual SiLU
     }
 }
 
