@@ -126,9 +126,11 @@ blit.endEncoding(); setupCB.commit(); setupCB.waitUntilCompleted()
 [gradW, gradNodeW, gradNodeB, gradCoordW, gradH, gradPos, gradMsg, weightsM, weightsV, normSq, lossT, lossV, hT, hV, posT, posV, aggT, aggV, msgT, msgV].forEach { ZeroInit($0) }
 KaimingInit(weights, count: hiddenDim * (2 * hiddenDim + 1), fanIn: (2 * hiddenDim + 1))
 KaimingInit(nodeW, count: hiddenDim * 2 * hiddenDim, fanIn: 2 * hiddenDim)
-KaimingInit(coordW, count: hiddenDim, fanIn: hiddenDim)
+
+// ZERO-INIT STABILIZER: Model starts still to prevent coordinate explosion
+ZeroInit(coordW); ZeroInit(bias); ZeroInit(coordB)
+
 KaimingInit(loader.nodeBuffer!, count: 10 * hiddenDim, fanIn: 10) // Embed Table Init
-ZeroInit(bias); ZeroInit(coordB)
 
 let nPtrT = noiseT.contents().bindMemory(to: Float.self, capacity: trainNodes * 3)
 for i in 0..<(trainNodes * 3) { nPtrT[i] = Float.random(in: -0.1...0.1) }
@@ -151,7 +153,7 @@ for epoch in 1...150 {
 
     // 1. TRAINING PHASE
     let reset = cb.makeBlitCommandEncoder()!
-    [gradW, gradNodeW, gradNodeB, gradCoordW, gradH, gradPos, gradMsg, hT, aggT, posT].forEach { reset.fill(buffer: $0, range: 0..<$0.length, value: 0) }
+    [gradW, gradNodeW, gradNodeB, gradCoordW, gradH, gradPos, gradMsg, hT, aggT, posT, normSq].forEach { reset.fill(buffer: $0, range: 0..<$0.length, value: 0) }
     reset.endEncoding()
 
     let enc = cb.makeComputeCommandEncoder()!
@@ -225,6 +227,22 @@ for epoch in 1...150 {
     enc.setBuffer(gradH, offset: 0, index: 6)
     enc.setBytes(&hDim, length: 4, index: 7)
     enc.dispatchThreads(MTLSize(width: trainNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+
+    // GRADIENT CLIPPING: Cap updates to prevent inf/nan explosions
+    enc.setComputePipelineState(p["compute_grad_norm_sq"]!)
+    enc.setBuffer(gradW, offset: 0, index: 0)
+    enc.setBuffer(normSq, offset: 0, index: 1)
+    var gradCount = UInt32(weights.length / 4)
+    enc.setBytes(&gradCount, length: 4, index: 2)
+    enc.dispatchThreads(MTLSize(width: Int(gradCount), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+
+    enc.setComputePipelineState(p["apply_clipping"]!)
+    enc.setBuffer(gradW, offset: 0, index: 0)
+    enc.setBuffer(normSq, offset: 0, index: 1)
+    var maxNorm: Float = 0.1
+    enc.setBytes(&maxNorm, length: 4, index: 2)
+    enc.setBytes(&gradCount, length: 4, index: 3)
+    enc.dispatchThreads(MTLSize(width: Int(gradCount), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
     enc.setComputePipelineState(p["apply_adam_update"]!)
     enc.setBuffer(weights, offset: 0, index: 0)
