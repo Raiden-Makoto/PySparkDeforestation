@@ -31,7 +31,7 @@ kernel void compute_message(
     
     float3 diff = nodes[idx].pos - nodes[jdx].pos;
     float dist = sqrt(dot(diff, diff) + 1e-8f);
-    float radial = 1.0f / (1.0f + dist);
+    float radial = 1.0f / (1.0f + dist + 1e-6f); // Guarded denominator
     
     uint input_dim = 2 * hidden_dim + 1;
 
