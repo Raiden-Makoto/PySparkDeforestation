@@ -48,8 +48,12 @@ kernel void backward_message(
     device float* grad_weights_out     [[buffer(4)]], // Weight gradients to accumulate
     device float* grad_inputs_out      [[buffer(5)]], // Gradients for h_i, h_j (for next backprop step)
     constant uint& hidden_dim          [[buffer(6)]],
+    constant uint& edge_count          [[buffer(7)]], // E
     uint gid [[thread_position_in_grid]]
 ){
+    if (gid >= edge_count) {
+        return;
+    }
     // threads per edge
     uint in_dim = 2 * hidden_dim + 1;
     for (uint h = 0; h < hidden_dim; h++) {
