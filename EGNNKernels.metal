@@ -26,7 +26,7 @@ kernel void compute_message(
     
     // Calculate Radial Invariant: squared distance + epsilon
     float3 diff = nodes[i].pos - nodes[j].pos;
-    float radial = dot(diff, diff) + 1e-8f;
+    float radial = min(dot(diff, diff), 2500.0f) + 1e-8f;
 
     for (uint row = 0; row < hidden_dim; row++) {
         float acc = bias[row];
@@ -54,6 +54,7 @@ kernel void compute_displacement(
                                  )
 {
     if (gid >= num_edges) return;
+    float scalar = clamp(coord_scalar[gid], -10.0f, 10.0f);
 
     int i = edge_index[gid].x;
     int j = edge_index[gid].y;
@@ -63,7 +64,18 @@ kernel void compute_displacement(
     float3 pos_j = nodes[j].pos;
     
     float3 diff = pos_i - pos_j;
-    float3 translation = diff * coord_scalar[gid];
+    // Limit the relative distance vector too (just in case)
+    if (length(diff) > 10.0f) {
+        diff = normalize(diff) * 10.0f;
+    }
+
+    float3 translation = diff * scalar;
+    
+    // Final sanity check: Don't let a single edge move an atom more than 5 Angstroms per step
+    float mag = length(translation);
+    if (mag > 5.0f) {
+        translation = normalize(translation) * 5.0f;
+    }
     
     // Manually write out to the flat float buffer (12-byte stride)
     uint base = gid * 3;
