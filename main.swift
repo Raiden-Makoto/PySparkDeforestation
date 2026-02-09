@@ -178,8 +178,34 @@ var nNodesU = UInt32(numNodes)
 
 print("STARTING DIFFUSION LOOP (500 -> 1)")
 
+let initCB = commandQueue.makeCommandBuffer()!
+let initEnc = initCB.makeComputeCommandEncoder()!
+initEnc.setComputePipelineState(pipeline["embed_atoms"]!)
+initEnc.setBuffer(typeBuf, offset: 0, index: 0); initEnc.setBuffer(weights["embedding.weight"]!, offset: 0, index: 1)
+initEnc.setBuffer(hBuf, offset: 0, index: 2);
+initEnc.setBytes(&hDim, length: 4, index: 3);
+initEnc.setBytes(&nNodesU, length: 4, index: 4)
+initEnc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+initEnc.endEncoding()
+initCB.commit()
+initCB.waitUntilCompleted()
+
+let baseHBuf = device.makeBuffer(length: hBuf.length, options: .storageModePrivate)!
+
+let copyCB = commandQueue.makeCommandBuffer()!
+let blitInit = copyCB.makeBlitCommandEncoder()!
+blitInit.copy(from: hBuf, sourceOffset: 0, to: baseHBuf, destinationOffset: 0, size: hBuf.length)
+blitInit.endEncoding()
+copyCB.commit()
+copyCB.waitUntilCompleted()
+
 for t in (1...500).reversed() {
     let currentT = Float(t)
+    let resetCB = commandQueue.makeCommandBuffer()!
+    let blit = resetCB.makeBlitCommandEncoder()!
+    blit.copy(from: baseHBuf, sourceOffset: 0, to: hBuf, destinationOffset: 0, size: hBuf.length)
+    blit.endEncoding()
+    resetCB.commit()
     
     // 1. UPDATE FREQUENCIES (CPU)
     var sinData = [Float](repeating: 0, count: hiddenDim)
@@ -193,14 +219,13 @@ for t in (1...500).reversed() {
     let stepCB = commandQueue.makeCommandBuffer()!
     
     // Clear Aggregators
-    let blit = stepCB.makeBlitCommandEncoder()!
-    blit.fill(buffer: msgAggBuf, range: 0..<msgAggBuf.length, value: 0)
-    blit.fill(buffer: posAggBuf, range: 0..<posAggBuf.length, value: 0)
-    blit.fill(buffer: cogBuf, range: 0..<cogBuf.length, value: 0)
-    blit.endEncoding()
+    let blit2 = stepCB.makeBlitCommandEncoder()!
+    blit2.fill(buffer: msgAggBuf, range: 0..<msgAggBuf.length, value: 0)
+    blit2.fill(buffer: posAggBuf, range: 0..<posAggBuf.length, value: 0)
+    blit2.fill(buffer: cogBuf, range: 0..<cogBuf.length, value: 0)
+    blit2.endEncoding()
     
     let enc = stepCB.makeComputeCommandEncoder()!
-
 
     // --- TIMESTEP MLP ---
     // Stage 1: Sin -> Temp
@@ -220,12 +245,6 @@ for t in (1...500).reversed() {
     enc.setBuffer(tProcessedBuf, offset: 0, index: 3)
     enc.setBytes(&skipSiLU, length: 4, index: 5)
     enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
-
-    // --- EMBEDDING ---
-    enc.setComputePipelineState(pipeline["embed_atoms"]!)
-    enc.setBuffer(typeBuf, offset: 0, index: 0); enc.setBuffer(weights["embedding.weight"]!, offset: 0, index: 1)
-    enc.setBuffer(hBuf, offset: 0, index: 2); enc.setBytes(&hDim, length: 4, index: 3); enc.setBytes(&nNodesU, length: 4, index: 4)
-    enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
     enc.setComputePipelineState(pipeline["inject_timestamp"]!)
     enc.setBuffer(hBuf, offset: 0, index: 0); enc.setBuffer(tProcessedBuf, offset: 0, index: 1)
@@ -252,6 +271,7 @@ for t in (1...500).reversed() {
         enc.dispatchThreads(MTLSize(width: numEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
         // B. COORDINATE MLP
+        enc.memoryBarrier(scope: .buffers)
         enc.setComputePipelineState(pipeline["linear_128x128"]!)
         enc.setBuffer(msgBuf, offset: 0, index: 0) // MsgBuf -> Stage 1
         enc.setBuffer(weights["layers.\(i).coord_mlp.0.weight"]!, offset: 0, index: 1)
@@ -259,7 +279,7 @@ for t in (1...500).reversed() {
         enc.setBuffer(tempH, offset: 0, index: 3) // Stage 1 -> Temp
         enc.setBytes(&nEdgesU, length: 4, index: 4); enc.setBytes(&doSiLU, length: 4, index: 5)
         enc.dispatchThreads(MTLSize(width: numEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-
+        
         enc.setComputePipelineState(pipeline["linear_128x1"]!)
         enc.setBuffer(tempH, offset: 0, index: 0) // Temp -> Stage 2
         enc.setBuffer(weights["layers.\(i).coord_mlp.2.weight"]!, offset: 0, index: 1)
@@ -324,8 +344,12 @@ for t in (1...500).reversed() {
     stepCB.waitUntilCompleted()
 
     if t % 50 == 0 || t == 1 {
-        let ptr = nodeBuf.contents().bindMemory(to: Node.self, capacity: numNodes)
-        print("Step \(t) | Carbon: \(ptr[0].pos)")
+        let scalarPtr = coordScalarBuf.contents().bindMemory(to: Float.self, capacity: numEdges)
+        print("Step \(t) | Edge 0 Force Scalar: \(scalarPtr[0]), \(scalarPtr[1])")
+        
+        let tPtr = tProcessedBuf.contents().bindMemory(to: Float.self, capacity: hiddenDim)
+        // Print the first 2 values of the processed timestep embedding
+        print("Step \(t) | Time Embedding [0...1]: \(tPtr[0]), \(tPtr[1])")
     }
 }
 
