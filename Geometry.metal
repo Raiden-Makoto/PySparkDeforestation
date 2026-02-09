@@ -11,26 +11,23 @@
 
 using namespace metal;
 
-kernel void compute_cog(
-    device const Node* nodes         [[buffer(0)]], // [N]
-    device atomic_float* cog_sum     [[buffer(1)]], // [3] (x, y, z)
-    constant uint& num_nodes         [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-){
-    if (gid >= num_nodes){ return; }
-    float3 pos = nodes[gid].pos;
-    atomic_fetch_add_explicit(&cog_sum[0], pos.x, memory_order_relaxed);
-    atomic_fetch_add_explicit(&cog_sum[1], pos.y, memory_order_relaxed);
-    atomic_fetch_add_explicit(&cog_sum[2], pos.z, memory_order_relaxed);
-}
+kernel void force_zero_center(
+    device Node* nodes        [[buffer(0)]],
+    constant uint& num_nodes  [[buffer(1)]],
+    uint gid [[thread_position_in_grid]])
+{
+    // Only one thread executes this to ensure perfect precision
+    if (gid != 0) return;
 
-kernel void cog_normalization(
-    device Node* nodes               [[buffer(0)]], // [N]
-    device const float* cog_sum      [[buffer(1)]], // [3]
-    constant uint& num_nodes         [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-){
-    if (gid >= num_nodes) return;
-    float3 centroid = float3(cog_sum[0], cog_sum[1], cog_sum[2]) / (float) num_nodes;
-    nodes[gid].pos -= centroid;
+    float3 sum = float3(0.0f);
+    for (uint i = 0; i < num_nodes; i++) {
+        sum += nodes[i].pos;
+    }
+    
+    float3 centroid = sum / (float)num_nodes;
+    
+    // Shift every node to be centered at (0,0,0)
+    for (uint i = 0; i < num_nodes; i++) {
+        nodes[i].pos -= centroid;
+    }
 }

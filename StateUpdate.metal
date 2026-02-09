@@ -35,43 +35,34 @@ kernel void aggregate(
 
 // STABILIZED UPDATE KERNEL
 kernel void apply_update(
-    device Node* nodes               [[buffer(0)]], // [N]
-    device float* h                  [[buffer(1)]], // [N * 128]
-    device const float* h_update     [[buffer(2)]], // [N * 128]
-    device const float* pos_agg      [[buffer(3)]], // [N * 3] (Summed forces)
+    device Node* nodes               [[buffer(0)]],
+    device float* h                  [[buffer(1)]],
+    device const float* h_update     [[buffer(2)]],
+    device const float* pos_agg      [[buffer(3)]],
     constant uint& hidden_dim        [[buffer(4)]],
     constant uint& num_nodes         [[buffer(5)]],
+    constant float& current_t        [[buffer(6)]], // Pass Float(t) from Swift
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= num_nodes) return;
 
-    // --- 1. STABILIZE POSITION UPDATE ---
-    
-    // Read the aggregated force vector (Sum of all neighbors)
     uint pBase = gid * 3;
-    float3 agg_force = float3(pos_agg[pBase], pos_agg[pBase + 1], pos_agg[pBase + 2]);
+    float3 move = float3(pos_agg[pBase], pos_agg[pBase + 1], pos_agg[pBase + 2]);
 
-    // A. Normalization: Divide by number of neighbors (N-1)
-    // For Methane (N=5), we divide by 4.0. This keeps the scale consistent.
-    float neighbor_scale = 1.0f / max(1.0f, (float)num_nodes - 1.0f);
+    // DIFFUSION SCALING: Updates should be proportional to the current timestep
+    // As t goes from 500 -> 1, this factor scales from 1.0 down to 0.002.
+    float t_scale = current_t / 500.0f;
     
-    // B. Damping: Reduce the step size slightly to prevent oscillation
-    float damping = 0.5f;
+    // Applying the 1/(N-1) normalization explicitly here
+    float norm = 1.0f / (float)(num_nodes - 1);
     
-    float3 move_vec = agg_force * neighbor_scale * damping;
+    float3 final_update = move * norm * t_scale;
 
-    // C. Hard Speed Limit (Clamping)
-    // Don't let any atom move more than 0.5 Angstroms in a single step.
-    // This prevents the "Teleportation" to coordinates like -600.
-    float dist = length(move_vec);
-    if (dist > 0.5f) {
-        move_vec = normalize(move_vec) * 0.5f;
-    }
+    // HARD CLAMP: Absolute safety to prevent teleportation
+    if (length(final_update) > 0.1f) final_update = normalize(final_update) * 0.1f;
 
-    // Apply the safe update
-    nodes[gid].pos += move_vec;
+    nodes[gid].pos += final_update;
 
-    // --- 2. UPDATE FEATURES (Standard Residual) ---
     for (uint i = 0; i < hidden_dim; i++) {
         h[gid * hidden_dim + i] += h_update[gid * hidden_dim + i];
     }

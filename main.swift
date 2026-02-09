@@ -8,21 +8,6 @@
 import Metal
 import Foundation
 
-// Simple SIMD3 normalization helper for Swift
-// Simple SIMD3 dot product helper for Swift
-@inline(__always)
-func dot(_ a: SIMD3<Float>, _ b: SIMD3<Float>) -> Float {
-    return a.x * b.x + a.y * b.y + a.z * b.z
-}
-
-@inline(__always)
-func normalize(_ v: SIMD3<Float>) -> SIMD3<Float> {
-    let len2 = dot(v, v)
-    if len2 == 0 { return SIMD3<Float>(0,0,0) }
-    let invLen = 1.0 / sqrt(len2)
-    return v * Float(invLen)
-}
-
 let sectionBreak = String(repeating: "=", count: 50)
 
 // --- CONFIGURATION ---
@@ -168,7 +153,7 @@ let allKernels = [
     "embed_atoms", "inject_timestamp",
     "compute_message", "compute_displacement", "compute_node",
     "aggregate", "apply_update",
-    "compute_cog", "cog_normalization",
+    "force_zero_center",
     "linear_128x128", "linear_128x1" // The new robust kernels
 ]
 
@@ -319,19 +304,20 @@ for t in (1...500).reversed() {
         enc.setBuffer(nodeBuf, offset: 0, index: 0); enc.setBuffer(hBuf, offset: 0, index: 1)
         enc.setBuffer(hUpdateBuf, offset: 0, index: 2); enc.setBuffer(posAggBuf, offset: 0, index: 3)
         enc.setBytes(&hDim, length: 4, index: 4); enc.setBytes(&nNodesU, length: 4, index: 5)
+        var currentT = Float(t)
+        enc.setBytes(&currentT, length: 4, index: 6) // Pass the time to the kernel
         enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     }
 
     // --- CoG NORMALIZATION ---
-    enc.setComputePipelineState(pipeline["compute_cog"]!)
-    enc.setBuffer(nodeBuf, offset: 0, index: 0); enc.setBuffer(cogBuf, offset: 0, index: 1)
-    enc.setBytes(&nNodesU, length: 4, index: 2)
-    enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-
-    enc.setComputePipelineState(pipeline["cog_normalization"]!)
-    enc.setBuffer(nodeBuf, offset: 0, index: 0); enc.setBuffer(cogBuf, offset: 0, index: 1)
-    enc.setBytes(&nNodesU, length: 4, index: 2)
-    enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.setComputePipelineState(pipeline["force_zero_center"]!)
+    enc.setBuffer(nodeBuf, offset: 0, index: 0)
+    enc.setBytes(&nNodesU, length: 4, index: 1)
+    // Dispatch exactly ONE thread to handle the whole molecule
+    enc.dispatchThreads(
+        MTLSize(width: 1, height: 1, depth: 1),
+        threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
+    )
 
     enc.endEncoding()
     stepCB.commit()
