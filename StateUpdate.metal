@@ -33,17 +33,45 @@ kernel void aggregate(
     }
 }
 
+// STABILIZED UPDATE KERNEL
 kernel void apply_update(
     device Node* nodes               [[buffer(0)]], // [N]
     device float* h                  [[buffer(1)]], // [N * 128]
-    device const float* h_update     [[buffer(2)]], // [N * 128] (Result of node_mlp)
-    device const float* pos_agg      [[buffer(3)]], // [N * 3]
+    device const float* h_update     [[buffer(2)]], // [N * 128]
+    device const float* pos_agg      [[buffer(3)]], // [N * 3] (Summed forces)
     constant uint& hidden_dim        [[buffer(4)]],
-    uint gid [[thread_position_in_grid]]
-){
-    float3 update = float3(pos_agg[gid * 3], pos_agg[gid * 3 + 1], pos_agg[gid * 3 + 2]);
-    nodes[gid].pos += update;
-    // Node Feature Residual: h_new = h + node_mlp(h, agg_msg)
+    constant uint& num_nodes         [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= num_nodes) return;
+
+    // --- 1. STABILIZE POSITION UPDATE ---
+    
+    // Read the aggregated force vector (Sum of all neighbors)
+    uint pBase = gid * 3;
+    float3 agg_force = float3(pos_agg[pBase], pos_agg[pBase + 1], pos_agg[pBase + 2]);
+
+    // A. Normalization: Divide by number of neighbors (N-1)
+    // For Methane (N=5), we divide by 4.0. This keeps the scale consistent.
+    float neighbor_scale = 1.0f / max(1.0f, (float)num_nodes - 1.0f);
+    
+    // B. Damping: Reduce the step size slightly to prevent oscillation
+    float damping = 0.5f;
+    
+    float3 move_vec = agg_force * neighbor_scale * damping;
+
+    // C. Hard Speed Limit (Clamping)
+    // Don't let any atom move more than 0.5 Angstroms in a single step.
+    // This prevents the "Teleportation" to coordinates like -600.
+    float dist = length(move_vec);
+    if (dist > 0.5f) {
+        move_vec = normalize(move_vec) * 0.5f;
+    }
+
+    // Apply the safe update
+    nodes[gid].pos += move_vec;
+
+    // --- 2. UPDATE FEATURES (Standard Residual) ---
     for (uint i = 0; i < hidden_dim; i++) {
         h[gid * hidden_dim + i] += h_update[gid * hidden_dim + i];
     }

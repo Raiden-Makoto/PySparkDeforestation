@@ -211,6 +211,7 @@ for t in (1...500).reversed() {
     let blit = stepCB.makeBlitCommandEncoder()!
     blit.fill(buffer: msgAggBuf, range: 0..<msgAggBuf.length, value: 0)
     blit.fill(buffer: posAggBuf, range: 0..<posAggBuf.length, value: 0)
+    blit.fill(buffer: cogBuf, range: 0..<cogBuf.length, value: 0)
     blit.endEncoding()
     
     let enc = stepCB.makeComputeCommandEncoder()!
