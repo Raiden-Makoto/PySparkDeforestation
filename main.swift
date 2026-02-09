@@ -41,13 +41,13 @@ var nodeInDim = UInt32(2 * hiddenDim) // [h, msg_agg]
 var weights: [String: MTLBuffer] = [:]
 
 guard let device = MTLCreateSystemDefaultDevice() else { fatalError("Metal not supported") }
+let commandQueue = device.makeCommandQueue()!
 
 // --- UTILITIES ---
 func ZeroInit(_ buffer: MTLBuffer) {
     // Sets Buffer contents to 0
     memset(buffer.contents(), 0, buffer.length)
 }
-
 
 func loadAndVerify(_ name: String, rows: Int, cols: Int, path: String) {
     let expectedBytes = rows * cols * 4 // float32 is 4 bytes
@@ -116,350 +116,234 @@ print("Chunk Verification: Loaded \(weights.count) total weight buffers.")
 print(sectionBreak)
 
 // --- DATA PREPARATION ---
-var numNodes = 5 // for Methane only
-var numEdges = 8 // for methane, 4 bonds x2 (bidirectional)
-let atomTypes: [Int32] = [6, 1, 1, 1, 1] // Example: Methane (C, H, H, H, H)
-
-var nNodes = UInt32(numNodes)
-// Output dimension for the Coordinate MLP final stage
-var outDim1 = UInt32(1)
-
-// Atom types and initial noise (The starting point)
-let nodeBuf = device.makeBuffer(length: numNodes * MemoryLayout<Node>.stride, options: .storageModeShared)!
-let typeBuf = device.makeBuffer(length: numNodes * MemoryLayout<Int32>.stride, options: .storageModeShared)!
-let edgeBuf = device.makeBuffer(length: numEdges * MemoryLayout<SIMD2<Int32>>.stride, options: .storageModeShared)!
-let hBuf = device.makeBuffer(length: numNodes * hiddenDim * 4, options: .storageModeShared)!
-
-// Methane (CH4) positions in angstroms (approx tetrahedral geometry)
-let a: Float = 1.09
-let carbonPos = SIMD3<Float>(0.0, 0.0, 0.0)
-// Four hydrogens at the corners of a tetrahedron around the origin
-let h1 = a * normalize(SIMD3<Float>( 1,  1,  1))
-let h2 = a * normalize(SIMD3<Float>(-1, -1,  1))
-let h3 = a * normalize(SIMD3<Float>(-1,  1, -1))
-let h4 = a * normalize(SIMD3<Float>( 1, -1, -1))
-let positions: [SIMD3<Float>] = [carbonPos, h1, h2, h3, h4]
-
-// Atom types in CHHHH order
+var numNodes = 5 // Methane
+var numEdges = 8 // 4 bonds * 2
 let atomTypesCH4: [Int32] = [6, 1, 1, 1, 1]
-// Build Node array matching device layout
-var hostNodes = [Node](repeating: Node(pos: SIMD3<Float>(0,0,0), atomType: 0), count: numNodes)
-for i in 0..<numNodes {
-    hostNodes[i] = Node(pos: positions[i], atomType: Float(atomTypesCH4[i]))
-}
-// Copy to device buffers
-nodeBuf.contents().copyMemory(from: hostNodes, byteCount: hostNodes.count * MemoryLayout<Node>.stride)
-typeBuf.contents().copyMemory(from: atomTypesCH4, byteCount: atomTypesCH4.count * MemoryLayout<Int32>.stride)
 
-// Bidirectional edges: C<->H for each H
-let edges: [SIMD2<Int32>] = [
-    SIMD2(0,1), SIMD2(1,0),
-    SIMD2(0,2), SIMD2(2,0),
-    SIMD2(0,3), SIMD2(3,0),
-    SIMD2(0,4), SIMD2(4,0)
-]
-precondition(edges.count == numEdges, "edges.count must equal numEdges")
-edgeBuf.contents().copyMemory(from: edges, byteCount: edges.count * MemoryLayout<SIMD2<Int32>>.stride)
+// GRAPH BUFFERS
+let nodeBuf = device.makeBuffer(length: numNodes * MemoryLayout<Node>.stride, options: .storageModeShared)!
+let typeBuf = device.makeBuffer(length: numNodes * 4, options: .storageModeShared)!
+let edgeBuf = device.makeBuffer(length: numEdges * MemoryLayout<SIMD2<Int32>>.stride, options: .storageModeShared)!
 
-let currentStep: Float = 501.0 // Example timestep index
-var sinData = [Float](repeating: 0, count: hiddenDim)
-let halfDim = hiddenDim / 2
-let exponentBase = log(10000.0) / Float(halfDim - 1)
-
-for i in 0..<halfDim {
-    let freq = exp(Float(i) * -exponentBase)
-    let arg = currentStep * freq
-    sinData[i] = sin(arg)
-    sinData[i + halfDim] = cos(arg)
-}
-
-// Create the buffer from the CPU data
-let tSinBuf = device.makeBuffer(bytes: sinData, length: hiddenDim * 4, options: .storageModeShared)!
-let tProcessedBuf = device.makeBuffer(length: hiddenDim * 4, options: .storageModeShared)! // Final t_emb after MLP
-
-// --- DISPATCH ---
-guard let library = device.makeDefaultLibrary() else { fatalError("Couldn't load default compute library.") }
-var pipeline: [String: MTLComputePipelineState] = [:]
-
-do {
-    // Pipeline for atom embedding lookup
-    let embedFunction = library.makeFunction(name: "embed_atoms")!
-    pipeline["embed_atoms"] = try device.makeComputePipelineState(function: embedFunction)
-    // Pipeline for timestep injection conditioning
-    let injectFunction = library.makeFunction(name: "inject_timestamp")!
-    pipeline["inject_timestamp"] = try device.makeComputePipelineState(function: injectFunction)
-    print("Embedding Pipelines: \(pipeline.keys.joined(separator: ", "))")
-} catch {
-    fatalError("Failed to create compute pipeline states: \(error)")
-}
-
-let commandQueue = device.makeCommandQueue()!
-let cb = commandQueue.makeCommandBuffer()!
-
-// Allocate the Buffers for the Main MLP stuff HERE
-// Temporary buffer for MLP stages (used to hold intermediate activations)
+// WORKSPACE BUFFERS
+// 1. Features & Messages
+let hBuf = device.makeBuffer(length: numNodes * hiddenDim * 4, options: .storageModeShared)!
 let tempH = device.makeBuffer(length: max(numNodes, numEdges) * hiddenDim * 4, options: .storageModeShared)!
-
-// Message buffers
 let msgBuf = device.makeBuffer(length: numEdges * hiddenDim * 4, options: .storageModeShared)!
 let msgAggBuf = device.makeBuffer(length: numNodes * hiddenDim * 4, options: .storageModeShared)!
 
-// Coordinate & Translation buffers
-let coordScalarBuf = device.makeBuffer(length: numEdges * 1 * 4, options: .storageModeShared)!
-let transBuf = device.makeBuffer(length: numEdges * 3 * MemoryLayout<Float>.stride, options: .storageModeShared)!
-let posAggBuf = device.makeBuffer(length: numNodes * 3 * MemoryLayout<Float>.stride, options: .storageModeShared)!
+// 2. Coordinates
+let coordScalarBuf = device.makeBuffer(length: numEdges * 4, options: .storageModeShared)! // 1 float per edge
+let transBuf = device.makeBuffer(length: numEdges * 3 * 4, options: .storageModeShared)! // 3 floats per edge
+let posAggBuf = device.makeBuffer(length: numNodes * 3 * 4, options: .storageModeShared)! // 3 floats per node
+let cogBuf = device.makeBuffer(length: 3 * 4, options: .storageModeShared)!
 
-// Node update residual
+// 3. Timestep specific buffers (CRITICAL for the loop)
+let tSinBuf = device.makeBuffer(length: hiddenDim * 4, options: .storageModeShared)!
+let tTempBuf = device.makeBuffer(length: hiddenDim * 4, options: .storageModeShared)! // Missing in previous version!
+let tProcessedBuf = device.makeBuffer(length: hiddenDim * 4, options: .storageModeShared)!
+
+// 4. Update Residual
 let hUpdateBuf = device.makeBuffer(length: numNodes * hiddenDim * 4, options: .storageModeShared)!
 
-print("EGNNLayer buffers allocated for \(numNodes) nodes and \(numEdges) edges.")
-
-let blit = cb.makeBlitCommandEncoder()!
-blit.fill(buffer: msgAggBuf, range: 0..<msgAggBuf.length, value: 0)
-blit.fill(buffer: posAggBuf, range: 0..<posAggBuf.length, value: 0)
-blit.endEncoding()
-
-let enc = cb.makeComputeCommandEncoder()!
-
-// A. Embed raw atom types
-enc.setComputePipelineState(pipeline["embed_atoms"]!)
-enc.setBuffer(typeBuf, offset: 0, index: 0)
-enc.setBuffer(weights["embedding.weight"], offset: 0, index: 1)
-enc.setBuffer(hBuf, offset: 0, index: 2)
-enc.setBytes(&hDim, length: 4, index: 3)
-enc.setBytes(&nNodes, length: 4, index: 4)
-enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-
-// B. Inject Timestep into Hidden States
-enc.setComputePipelineState(pipeline["inject_timestamp"]!)
-enc.setBuffer(hBuf, offset: 0, index: 0)
-enc.setBuffer(tProcessedBuf, offset: 0, index: 1)
-enc.setBytes(&hDim, length: 4, index: 2)
-enc.setBytes(&nNodes, length: 4, index: 3)
-enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-
-print("Features embedded and conditioned on timestep.")
-print(sectionBreak)
-
-do {
-    let linearFunc = library.makeFunction(name: "linear_layer")!
-    pipeline["linear_layer"] = try device.makeComputePipelineState(function: linearFunc)
-} catch {
-    fatalError("Failed to create compute pipeline states: \(error)")
+// --- INITIALIZATION ---
+// Initialize Nodes with Noise
+var noiseNodes = [Node](repeating: Node(pos: .init(0,0,0), atomType: 0), count: numNodes)
+for i in 0..<numNodes {
+    noiseNodes[i] = Node(pos: SIMD3<Float>(Float.random(in: -1...1), Float.random(in: -1...1), Float.random(in: -1...1)), atomType: Float(atomTypesCH4[i]))
 }
+nodeBuf.contents().copyMemory(from: noiseNodes, byteCount: numNodes * MemoryLayout<Node>.stride)
+typeBuf.contents().copyMemory(from: atomTypesCH4, byteCount: numNodes * 4)
 
-var applySiLU: Bool = true
-var noSiLU: Bool = false
+// Initialize Edges
+let edges: [SIMD2<Int32>] = [SIMD2(0,1), SIMD2(1,0), SIMD2(0,2), SIMD2(2,0), SIMD2(0,3), SIMD2(3,0), SIMD2(0,4), SIMD2(4,0)]
+edgeBuf.contents().copyMemory(from: edges, byteCount: numEdges * MemoryLayout<SIMD2<Int32>>.stride)
 
-print("Timstep MLP Activated")
-// Linear (128, 128) + SiLU
-enc.setComputePipelineState(pipeline["linear_layer"]!)
-enc.setBuffer(tSinBuf, offset: 0, index: 0) // Raw Sinusoidal input
-enc.setBuffer(weights["timestep_mlp.0.weight"], offset: 0, index: 1)
-enc.setBuffer(weights["timestep_mlp.0.bias"], offset: 0, index: 2)
-enc.setBuffer(tProcessedBuf, offset: 0, index: 3)
-enc.setBytes(&hDim, length: 4, index: 4) // inDim
-enc.setBytes(&hDim, length: 4, index: 5) // outDim
-enc.setBytes(&applySiLU, length: 1, index: 6)
-enc.dispatchThreads(
-    MTLSize(width: hiddenDim, height: 1, depth: 1),
-    threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
-)
-// Linear (128, 128) - No Activation
-enc.setBuffer(tProcessedBuf, offset: 0, index: 0)
-enc.setBuffer(weights["timestep_mlp.2.weight"], offset: 0, index: 1)
-enc.setBuffer(weights["timestep_mlp.2.bias"], offset: 0, index: 2)
-enc.setBuffer(tProcessedBuf, offset: 0, index: 3) // Overwrite with final result
-enc.setBytes(&noSiLU, length: 1, index: 6) // apply_silu = false
-enc.dispatchThreads(
-    MTLSize(width: hiddenDim, height: 1, depth: 1),
-    threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
-)
-print("Timstep MLP Complete")
-print(sectionBreak)
-print("Three-Layer EGNNLayer Loop Activated")
+// --- PIPELINE SETUP ---
+guard let library = device.makeDefaultLibrary() else { fatalError() }
+var pipeline: [String: MTLComputePipelineState] = [:]
 
-let layerKernels = [
-    "compute_message",
-    "compute_displacement",
-    "compute_node",
-    "aggregate",
-    "apply_update"
+// Register all required kernels
+let allKernels = [
+    "embed_atoms", "inject_timestamp",
+    "compute_message", "compute_displacement", "compute_node",
+    "aggregate", "apply_update",
+    "compute_cog", "cog_normalization",
+    "linear_128x128", "linear_128x1" // The new robust kernels
 ]
 
-for name in layerKernels{
-    pipeline[name] = try! device.makeComputePipelineState(function: library.makeFunction(name: name)!)
+for name in allKernels {
+    guard let fn = library.makeFunction(name: name) else { fatalError("Kernel \(name) not found in Library!") }
+    pipeline[name] = try! device.makeComputePipelineState(function: fn)
 }
 
-let geometryKernels = [
-    "cog_normalization",
-    "compute_cog"
-]
-
-for name in geometryKernels{
-    pipeline[name] = try! device.makeComputePipelineState(function: library.makeFunction(name: name)!)
-}
-
-for i in 0..<3 {
-    print("\tCurrently in Layer \(i)...")
-    // 1. MESSAGE MLP
-    enc.setComputePipelineState(pipeline["compute_message"]!)
-    enc.setBuffer(hBuf, offset: 0, index: 0);
-    enc.setBuffer(nodeBuf, offset: 0, index: 1);
-    enc.setBuffer(edgeBuf, offset: 0, index: 2)
-    enc.setBuffer(weights["layers.\(i).message_mlp.0.weight"], offset: 0, index: 3);
-    enc.setBuffer(weights["layers.\(i).message_mlp.0.bias"], offset: 0, index: 4)
-    enc.setBuffer(msgBuf, offset: 0, index: 5);
-    enc.setBytes(&hDim, length: 4, index: 6)
-    enc.dispatchThreads(
-        MTLSize(width: numEdges, height: 1, depth: 1),
-        threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
-    )
-    // Linear -> SiLU -> Linear
-    enc.setComputePipelineState(pipeline["linear_layer"]!) // Message Stage 2
-    enc.setBuffer(msgBuf, offset: 0, index: 0);
-    enc.setBuffer(weights["layers.\(i).message_mlp.2.weight"], offset: 0, index: 1);
-    enc.setBuffer(weights["layers.\(i).message_mlp.2.bias"], offset: 0, index: 2)
-    enc.setBuffer(msgBuf, offset: 0, index: 3);
-    enc.setBytes(&hDim, length: 4, index: 4);
-    enc.setBytes(&hDim, length: 4, index: 5);
-    enc.setBytes(&noSiLU, length: 1, index: 6)
-    enc.dispatchThreads(
-        MTLSize(width: numEdges, height: 1, depth: 1),
-        threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
-    )
-    // 2. COORDINATE MLP & DISPLACEMENT
-    enc.setComputePipelineState(pipeline["linear_layer"]!) // Coord Stage 1
-    enc.setBuffer(msgBuf, offset: 0, index: 0);
-    enc.setBuffer(weights["layers.\(i).coord_mlp.0.weight"], offset: 0, index: 1);
-    enc.setBuffer(weights["layers.\(i).coord_mlp.0.bias"], offset: 0, index: 2)
-    enc.setBuffer(tempH, offset: 0, index: 3);
-    enc.setBytes(&hDim, length: 4, index: 4);
-    enc.setBytes(&hDim, length: 4, index: 5);
-    enc.setBytes(&applySiLU, length: 1, index: 6)
-    enc.dispatchThreads(
-        MTLSize(width: numEdges, height: 1, depth: 1),
-        threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
-    )
-    // Linear -> SiLU -> Linear
-    enc.setBuffer(tempH, offset: 0, index: 0);
-    enc.setBuffer(weights["layers.\(i).coord_mlp.2.weight"], offset: 0, index: 1);
-    enc.setBuffer(weights["layers.\(i).coord_mlp.2.bias"], offset: 0, index: 2)
-    enc.setBuffer(coordScalarBuf, offset: 0, index: 3);
-    enc.setBytes(&hDim, length: 4, index: 4);
-    enc.setBytes(&outDim1, length: 4, index: 5);
-    enc.setBytes(&noSiLU, length: 1, index: 6)
-    enc.dispatchThreads(
-        MTLSize(width: numEdges, height: 1, depth: 1),
-        threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
-    )
-    // Compute Displacement
-    enc.setComputePipelineState(pipeline["compute_displacement"]!)
-    enc.setBuffer(coordScalarBuf, offset: 0, index: 0);
-    enc.setBuffer(nodeBuf, offset: 0, index: 1);
-    enc.setBuffer(edgeBuf, offset: 0, index: 2);
-    enc.setBuffer(transBuf, offset: 0, index: 3)
-    enc.setBytes(&numEdges, length: 4, index: 4)
-    enc.dispatchThreads(
-        MTLSize(width: numEdges, height: 1, depth: 1),
-        threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
-    )
-    // 3. AGGREGATE
-    enc.setComputePipelineState(pipeline["aggregate"]!)
-    enc.setBuffer(msgBuf, offset: 0, index: 0);
-    enc.setBuffer(transBuf, offset: 0, index: 1);
-    enc.setBuffer(edgeBuf, offset: 0, index: 2)
-    enc.setBuffer(msgAggBuf, offset: 0, index: 3);
-    enc.setBuffer(posAggBuf, offset: 0, index: 4);
-    enc.setBytes(&hDim, length: 4, index: 5)
-    enc.setBytes(&numEdges, length: 4, index: 6)
-    enc.dispatchThreads(
-        MTLSize(width: numEdges, height: 1, depth: 1),
-        threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
-    )
-    // 4. NODE MLP
-    enc.setComputePipelineState(pipeline["compute_node"]!) // SiLU is built in
-    enc.setBuffer(hBuf, offset: 0, index: 0);
-    enc.setBuffer(msgAggBuf, offset: 0, index: 1);
-    enc.setBuffer(weights["layers.\(i).node_mlp.0.weight"], offset: 0, index: 2);
-    enc.setBuffer(weights["layers.\(i).node_mlp.0.bias"], offset: 0, index: 3)
-    enc.setBuffer(tempH, offset: 0, index: 4);
-    enc.setBytes(&hDim, length: 4, index: 5)
-    enc.dispatchThreads(
-        MTLSize(width: numNodes, height: 1, depth: 1),
-        threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
-    )
-    // Linear -> SiLU -> Linear
-    enc.setComputePipelineState(pipeline["linear_layer"]!)
-    enc.setBuffer(tempH, offset: 0, index: 0);
-    enc.setBuffer(weights["layers.\(i).node_mlp.2.weight"], offset: 0, index: 1);
-    enc.setBuffer(weights["layers.\(i).node_mlp.2.bias"], offset: 0, index: 2)
-    enc.setBuffer(hUpdateBuf, offset: 0, index: 3);
-    enc.setBytes(&hDim, length: 4, index: 4); enc.setBytes(&hDim, length: 4, index: 5);
-    enc.setBytes(&noSiLU, length: 1, index: 6)
-    enc.dispatchThreads(
-        MTLSize(width: numNodes, height: 1, depth: 1),
-        threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
-    )
-    // 5. RESIDUAL CONNECTIONS
-    enc.setComputePipelineState(pipeline["apply_update"]!)
-    enc.setBuffer(nodeBuf, offset: 0, index: 0);
-    enc.setBuffer(hBuf, offset: 0, index: 1);
-    enc.setBuffer(hUpdateBuf, offset: 0, index: 2);
-    enc.setBuffer(posAggBuf, offset: 0, index: 3);
-    enc.setBytes(&hDim, length: 4, index: 4)
-    enc.dispatchThreads(
-        MTLSize(width: numNodes, height: 1, depth: 1),
-        threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
-    )
-}
-
-enc.endEncoding()
-cb.commit()
-cb.waitUntilCompleted()
-
-print("Three Layer EGNNLayer Stack Complete")
+print("Buffers & Pipelines Ready.")
 print(sectionBreak)
 
-// Apply Center of Gravity Normalization
-let cogBuf = device.makeBuffer(length: 3 * MemoryLayout<Float>.stride, options: .storageModeShared)!
-let cogCB = commandQueue.makeCommandBuffer()!
+// --- DIFFUSION LOOP ---
+let halfDim = hiddenDim / 2
+let exponentBase = log(10000.0) / Float(halfDim - 1)
 
-// Reset the CoG sum buffer to zero
-let cogBlit = cogCB.makeBlitCommandEncoder()!
-cogBlit.fill(buffer: cogBuf, range: 0..<cogBuf.length, value: 0)
-cogBlit.endEncoding()
+// SAFETY FLAGS (UInt32 for 4-byte alignment)
+var doSiLU: UInt32 = 1
+var skipSiLU: UInt32 = 0
+var oneItem: UInt32 = 1
+var nEdgesU = UInt32(numEdges)
+var nNodesU = UInt32(numNodes)
 
-let cogEnc = cogCB.makeComputeCommandEncoder()!
+print("STARTING DIFFUSION LOOP (500 -> 1)")
 
-// Compute the sum of all positions
-cogEnc.setComputePipelineState(pipeline["compute_cog"]!)
-cogEnc.setBuffer(nodeBuf, offset: 0, index: 0)
-cogEnc.setBuffer(cogBuf, offset: 0, index: 1)
-cogEnc.setBytes(&nNodes, length: 4, index: 2)
-cogEnc.dispatchThreads(
-    MTLSize(width: numNodes, height: 1, depth: 1),
-    threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
-)
+for t in (1...500).reversed() {
+    let currentT = Float(t)
+    
+    // 1. UPDATE FREQUENCIES (CPU)
+    var sinData = [Float](repeating: 0, count: hiddenDim)
+    for i in 0..<halfDim {
+        let freq = exp(Float(i) * -exponentBase)
+        let arg = currentT * freq
+        sinData[i] = sin(arg); sinData[i + halfDim] = cos(arg)
+    }
+    tSinBuf.contents().copyMemory(from: sinData, byteCount: hiddenDim * 4)
 
-// Subtract the centroid from every node
-cogEnc.setComputePipelineState(pipeline["cog_normalization"]!)
-cogEnc.setBuffer(nodeBuf, offset: 0, index: 0)
-cogEnc.setBuffer(cogBuf, offset: 0, index: 1)
-cogEnc.setBytes(&nNodes, length: 4, index: 2)
-cogEnc.dispatchThreads(
-    MTLSize(width: numNodes, height: 1, depth: 1),
-    threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
-)
+    let stepCB = commandQueue.makeCommandBuffer()!
+    
+    // Clear Aggregators
+    let blit = stepCB.makeBlitCommandEncoder()!
+    blit.fill(buffer: msgAggBuf, range: 0..<msgAggBuf.length, value: 0)
+    blit.fill(buffer: posAggBuf, range: 0..<posAggBuf.length, value: 0)
+    blit.endEncoding()
+    
+    let enc = stepCB.makeComputeCommandEncoder()!
 
-cogEnc.endEncoding()
-cogCB.commit()
-cogCB.waitUntilCompleted()
 
-print("Molecule centered at origin.")
+    // --- TIMESTEP MLP ---
+    // Stage 1: Sin -> Temp
+    enc.setComputePipelineState(pipeline["linear_128x128"]!)
+    enc.setBuffer(tSinBuf, offset: 0, index: 0)
+    enc.setBuffer(weights["timestep_mlp.0.weight"]!, offset: 0, index: 1)
+    enc.setBuffer(weights["timestep_mlp.0.bias"]!, offset: 0, index: 2)
+    enc.setBuffer(tTempBuf, offset: 0, index: 3) // Output to Temp
+    enc.setBytes(&oneItem, length: 4, index: 4) // Count = 1
+    enc.setBytes(&doSiLU, length: 4, index: 5)
+    enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+
+    // Stage 2: Temp -> Processed
+    enc.setBuffer(tTempBuf, offset: 0, index: 0)
+    enc.setBuffer(weights["timestep_mlp.2.weight"]!, offset: 0, index: 1)
+    enc.setBuffer(weights["timestep_mlp.2.bias"]!, offset: 0, index: 2)
+    enc.setBuffer(tProcessedBuf, offset: 0, index: 3)
+    enc.setBytes(&skipSiLU, length: 4, index: 5)
+    enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+
+    // --- EMBEDDING ---
+    enc.setComputePipelineState(pipeline["embed_atoms"]!)
+    enc.setBuffer(typeBuf, offset: 0, index: 0); enc.setBuffer(weights["embedding.weight"]!, offset: 0, index: 1)
+    enc.setBuffer(hBuf, offset: 0, index: 2); enc.setBytes(&hDim, length: 4, index: 3); enc.setBytes(&nNodesU, length: 4, index: 4)
+    enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+
+    enc.setComputePipelineState(pipeline["inject_timestamp"]!)
+    enc.setBuffer(hBuf, offset: 0, index: 0); enc.setBuffer(tProcessedBuf, offset: 0, index: 1)
+    enc.setBytes(&hDim, length: 4, index: 2); enc.setBytes(&nNodesU, length: 4, index: 3)
+    enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+
+    // --- EGNN LAYERS ---
+    for i in 0..<3 {
+        // A. MESSAGE MLP
+        enc.setComputePipelineState(pipeline["compute_message"]!)
+        enc.setBuffer(hBuf, offset: 0, index: 0); enc.setBuffer(nodeBuf, offset: 0, index: 1); enc.setBuffer(edgeBuf, offset: 0, index: 2)
+        enc.setBuffer(weights["layers.\(i).message_mlp.0.weight"]!, offset: 0, index: 3)
+        enc.setBuffer(weights["layers.\(i).message_mlp.0.bias"]!, offset: 0, index: 4)
+        enc.setBuffer(tempH, offset: 0, index: 5) // Stage 1 -> Temp
+        enc.setBytes(&hDim, length: 4, index: 6)
+        enc.dispatchThreads(MTLSize(width: numEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+
+        enc.setComputePipelineState(pipeline["linear_128x128"]!)
+        enc.setBuffer(tempH, offset: 0, index: 0) // Temp -> Stage 2
+        enc.setBuffer(weights["layers.\(i).message_mlp.2.weight"]!, offset: 0, index: 1)
+        enc.setBuffer(weights["layers.\(i).message_mlp.2.bias"]!, offset: 0, index: 2)
+        enc.setBuffer(msgBuf, offset: 0, index: 3) // Stage 2 -> MsgBuf
+        enc.setBytes(&nEdgesU, length: 4, index: 4); enc.setBytes(&skipSiLU, length: 4, index: 5)
+        enc.dispatchThreads(MTLSize(width: numEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+
+        // B. COORDINATE MLP
+        enc.setComputePipelineState(pipeline["linear_128x128"]!)
+        enc.setBuffer(msgBuf, offset: 0, index: 0) // MsgBuf -> Stage 1
+        enc.setBuffer(weights["layers.\(i).coord_mlp.0.weight"]!, offset: 0, index: 1)
+        enc.setBuffer(weights["layers.\(i).coord_mlp.0.bias"]!, offset: 0, index: 2)
+        enc.setBuffer(tempH, offset: 0, index: 3) // Stage 1 -> Temp
+        enc.setBytes(&nEdgesU, length: 4, index: 4); enc.setBytes(&doSiLU, length: 4, index: 5)
+        enc.dispatchThreads(MTLSize(width: numEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+
+        enc.setComputePipelineState(pipeline["linear_128x1"]!)
+        enc.setBuffer(tempH, offset: 0, index: 0) // Temp -> Stage 2
+        enc.setBuffer(weights["layers.\(i).coord_mlp.2.weight"]!, offset: 0, index: 1)
+        enc.setBuffer(weights["layers.\(i).coord_mlp.2.bias"]!, offset: 0, index: 2)
+        enc.setBuffer(coordScalarBuf, offset: 0, index: 3) // Stage 2 -> Scalar
+        enc.setBytes(&nEdgesU, length: 4, index: 4); enc.setBytes(&skipSiLU, length: 4, index: 5)
+        enc.dispatchThreads(MTLSize(width: numEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+
+        enc.setComputePipelineState(pipeline["compute_displacement"]!)
+        enc.setBuffer(coordScalarBuf, offset: 0, index: 0); enc.setBuffer(nodeBuf, offset: 0, index: 1)
+        enc.setBuffer(edgeBuf, offset: 0, index: 2); enc.setBuffer(transBuf, offset: 0, index: 3)
+        enc.setBytes(&nEdgesU, length: 4, index: 4)
+        enc.dispatchThreads(MTLSize(width: numEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+
+        // C. AGGREGATE
+        enc.setComputePipelineState(pipeline["aggregate"]!)
+        enc.setBuffer(msgBuf, offset: 0, index: 0); enc.setBuffer(transBuf, offset: 0, index: 1)
+        enc.setBuffer(edgeBuf, offset: 0, index: 2); enc.setBuffer(msgAggBuf, offset: 0, index: 3)
+        enc.setBuffer(posAggBuf, offset: 0, index: 4); enc.setBytes(&hDim, length: 4, index: 5)
+        enc.setBytes(&nEdgesU, length: 4, index: 6)
+        enc.dispatchThreads(MTLSize(width: numEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+
+        // D. NODE MLP
+        enc.setComputePipelineState(pipeline["compute_node"]!)
+        enc.setBuffer(hBuf, offset: 0, index: 0); enc.setBuffer(msgAggBuf, offset: 0, index: 1)
+        enc.setBuffer(weights["layers.\(i).node_mlp.0.weight"]!, offset: 0, index: 2)
+        enc.setBuffer(weights["layers.\(i).node_mlp.0.bias"]!, offset: 0, index: 3)
+        enc.setBuffer(tempH, offset: 0, index: 4) // Stage 1 -> Temp
+        enc.setBytes(&hDim, length: 4, index: 5)
+        enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+
+        enc.setComputePipelineState(pipeline["linear_128x128"]!)
+        enc.setBuffer(tempH, offset: 0, index: 0) // Temp -> Stage 2
+        enc.setBuffer(weights["layers.\(i).node_mlp.2.weight"]!, offset: 0, index: 1)
+        enc.setBuffer(weights["layers.\(i).node_mlp.2.bias"]!, offset: 0, index: 2)
+        enc.setBuffer(hUpdateBuf, offset: 0, index: 3) // Stage 2 -> Update
+        enc.setBytes(&nNodesU, length: 4, index: 4); enc.setBytes(&skipSiLU, length: 4, index: 5)
+        enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+
+        // E. UPDATE
+        enc.setComputePipelineState(pipeline["apply_update"]!)
+        enc.setBuffer(nodeBuf, offset: 0, index: 0); enc.setBuffer(hBuf, offset: 0, index: 1)
+        enc.setBuffer(hUpdateBuf, offset: 0, index: 2); enc.setBuffer(posAggBuf, offset: 0, index: 3)
+        enc.setBytes(&hDim, length: 4, index: 4); enc.setBytes(&nNodesU, length: 4, index: 5)
+        enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    }
+
+    // --- CoG NORMALIZATION ---
+    enc.setComputePipelineState(pipeline["compute_cog"]!)
+    enc.setBuffer(nodeBuf, offset: 0, index: 0); enc.setBuffer(cogBuf, offset: 0, index: 1)
+    enc.setBytes(&nNodesU, length: 4, index: 2)
+    enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+
+    enc.setComputePipelineState(pipeline["cog_normalization"]!)
+    enc.setBuffer(nodeBuf, offset: 0, index: 0); enc.setBuffer(cogBuf, offset: 0, index: 1)
+    enc.setBytes(&nNodesU, length: 4, index: 2)
+    enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+
+    enc.endEncoding()
+    stepCB.commit()
+    stepCB.waitUntilCompleted()
+
+    if t % 50 == 0 || t == 1 {
+        let ptr = nodeBuf.contents().bindMemory(to: Node.self, capacity: numNodes)
+        print("Step \(t) | Carbon: \(ptr[0].pos)")
+    }
+}
+
 print(sectionBreak)
-print("Final Molecular Coordinates (Angstroms)")
-
+print("Generation Complete.")
 // Access the raw pointer from the GPU buffer
 let pointer = nodeBuf.contents().bindMemory(to: Node.self, capacity: numNodes)
 
