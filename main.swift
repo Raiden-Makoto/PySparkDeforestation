@@ -345,15 +345,6 @@ for t in (1...500).reversed() {
     enc.endEncoding()
     stepCB.commit()
     stepCB.waitUntilCompleted()
-
-    if t % 50 == 0 || t == 1 {
-        let scalarPtr = coordScalarBuf.contents().bindMemory(to: Float.self, capacity: numEdges)
-        print("Step \(t) | Edge 0 Force Scalar: \(scalarPtr[0]), \(scalarPtr[1])")
-        
-        let tPtr = tProcessedBuf.contents().bindMemory(to: Float.self, capacity: hiddenDim)
-        // Print the first 2 values of the processed timestep embedding
-        print("Step \(t) | Time Embedding [0...1]: \(tPtr[0]), \(tPtr[1])")
-    }
 }
 
 print(sectionBreak)

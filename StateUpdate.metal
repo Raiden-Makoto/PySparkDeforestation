@@ -51,7 +51,8 @@ kernel void apply_update(
 
     // DIFFUSION SCALING: Updates should be proportional to the current timestep
     // As t goes from 500 -> 1, this factor scales from 1.0 down to 0.002.
-    float t_scale = current_t / 500.0f;
+    float t_normalized = current_t / 500.0f;
+    float t_scale = exp(5.0f * (t_normalized - 1.0f));
     
     // Applying the 1/(N-1) normalization explicitly here
     float norm = 1.0f / (float)(num_nodes - 1);
@@ -59,7 +60,7 @@ kernel void apply_update(
     float3 final_update = move * norm * t_scale;
 
     // HARD CLAMP: Absolute safety to prevent teleportation
-    if (length(final_update) > 0.1f) final_update = normalize(final_update) * 0.1f;
+    if (length(final_update) > 0.03f) final_update = normalize(final_update) * 0.03f;
 
     nodes[gid].pos += final_update;
 
