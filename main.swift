@@ -7,6 +7,7 @@
 
 import Metal
 import Foundation
+import simd
 
 let sectionBreak = String(repeating: "=", count: 50)
 
@@ -133,11 +134,6 @@ alphasCumprodBuf.contents().copyMemory(from: alphasCumprod, byteCount: 501 * 4)
 // check the schedule is correct
 let aPtr = alphasBuf.contents().bindMemory(to: Float.self, capacity: 501)
 let acPtr = alphasCumprodBuf.contents().bindMemory(to: Float.self, capacity: 501)
-print("Schedule Check")
-for checkT in [0, 1, 250, 500] {
-    print(String(format: "t=%3d | Alpha: %.6f | AlphaCumprod: %.6f", checkT, aPtr[checkT], acPtr[checkT]))
-}
-print(sectionBreak)
 
 // GRAPH BUFFERS
 let nodeBuf = device.makeBuffer(length: numNodes * MemoryLayout<Node>.stride, options: .storageModeShared)!
@@ -390,6 +386,23 @@ for t in (1...500).reversed() {
     enc.endEncoding()
     stepCB.commit()
     stepCB.waitUntilCompleted()
+    
+    if (t % 50 == 0) {
+        // Sync the GPU buffer to a CPU pointer
+        let ptr = nodeBuf.contents().bindMemory(to: Node.self, capacity: numNodes)
+        
+        // Use the explicit SIMD length function
+        let maxDist = (0..<numNodes).map { i in
+            simd.length(ptr[i].pos) // This is the standard Swift SIMD function
+        }.max() ?? 0
+        
+        // Calculate actual CoG to see if the GPU kernel is drifting
+        var sum = SIMD3<Float>(0,0,0)
+        for i in 0..<numNodes { sum += ptr[i].pos }
+        let actualCoG = sum / Float(numNodes)
+
+        print(String(format: "Step %d | CoG: (%.4f, %.4f, %.4f) | Max Dist: %.2f Å", t, actualCoG.x, actualCoG.y, actualCoG.z, maxDist))
+    }
 }
 
 print(sectionBreak)
