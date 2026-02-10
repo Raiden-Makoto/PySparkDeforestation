@@ -54,31 +54,28 @@ kernel void compute_displacement(
                                  )
 {
     if (gid >= num_edges) return;
-    float scalar = clamp(coord_scalar[gid], -10.0f, 10.0f);
+
+    // 1. Properly index the flat float buffer (12-byte stride)
+    uint base = gid * 3;
+
+    // 2. Clamp the scalar to a reasonable range to prevent the Galaxy Exit
+    float scalar = clamp(coord_scalar[gid], -1.0f, 1.0f);
 
     int i = edge_index[gid].x;
     int j = edge_index[gid].y;
     
-    // Access positions via the Node struct (ensure Node.pos is SIMD3/float3)
     float3 pos_i = nodes[i].pos;
     float3 pos_j = nodes[j].pos;
     
+    // 3. Calculate relative displacement
     float3 diff = pos_i - pos_j;
-    // Limit the relative distance vector too (just in case)
-    if (length(diff) > 10.0f) {
-        diff = normalize(diff) * 10.0f;
-    }
+    float dist = length(diff) + 1e-6f;
+    
+    // 4. Use unit direction so the force doesn't scale with the 17,000Å gap
+    float3 unit_direction = diff / dist;
+    float3 translation = unit_direction * scalar;
 
-    float3 translation = diff * scalar;
-    
-    // Final sanity check: Don't let a single edge move an atom more than 5 Angstroms per step
-    float mag = length(translation);
-    if (mag > 5.0f) {
-        translation = normalize(translation) * 5.0f;
-    }
-    
-    // Manually write out to the flat float buffer (12-byte stride)
-    uint base = gid * 3;
+    // 5. Write out the final floats
     trans_out[base + 0] = translation.x;
     trans_out[base + 1] = translation.y;
     trans_out[base + 2] = translation.z;

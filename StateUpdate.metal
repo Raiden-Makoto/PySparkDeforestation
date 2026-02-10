@@ -29,42 +29,33 @@ kernel void aggregate(
     }
     // Aggregate coordinate translations into node i
     for (uint c = 0; c < 3; c++){
-        atomic_fetch_add_explicit(&pos_agg[i * 3 + c], ((device float*)&trans[gid])[c], memory_order_relaxed);
+        atomic_fetch_add_explicit(&pos_agg[i * 3 + c], trans[gid * 3 + c], memory_order_relaxed);
     }
 }
 
 // STABILIZED UPDATE KERNEL
-kernel void apply_update(
-    device Node* nodes               [[buffer(0)]],
-    device float* h                  [[buffer(1)]],
-    device const float* h_update     [[buffer(2)]],
-    device const float* pos_agg      [[buffer(3)]],
-    constant uint& hidden_dim        [[buffer(4)]],
-    constant uint& num_nodes         [[buffer(5)]],
-    constant float& current_t        [[buffer(6)]], // Pass Float(t) from Swift
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid >= num_nodes) return;
-
+kernel void apply_diffusion(
+                            device Node* nodes               [[buffer(0)]],
+                            device const float* alphas       [[buffer(1)]],
+                            device const float* alphas_cp    [[buffer(2)]],
+                            device const float* pos_agg      [[buffer(3)]], // Model epsilon prediction
+                            constant uint& current_t         [[buffer(4)]],
+                            constant uint& num_nodes         [[buffer(5)]],
+                            uint gid [[thread_position_in_grid]]
+                            ){
+    if (gid >= num_nodes){ return; }
+    float a_t = alphas[current_t];
+    float a_bar_t = max(alphas_cp[current_t], 1e-6);
+    
+    // 2. Extract model output (epsilon)
     uint pBase = gid * 3;
-    float3 move = float3(pos_agg[pBase], pos_agg[pBase + 1], pos_agg[pBase + 2]);
-
-    // DIFFUSION SCALING: Updates should be proportional to the current timestep
-    // As t goes from 500 -> 1, this factor scales from 1.0 down to 0.002.
-    float t_normalized = current_t / 500.0f;
-    float t_scale = exp(5.0f * (t_normalized - 1.0f));
+    float3 epsilon = float3(pos_agg[pBase], pos_agg[pBase + 1], pos_agg[pBase + 2]);
     
-    // Applying the 1/(N-1) normalization explicitly here
-    float norm = 1.0f / (float)(num_nodes - 1);
-    
-    float3 final_update = move * norm * t_scale;
+    // 3. DDPM Reverse Step: x_{t-1} calculation
+    // This formula removes the predicted noise from the current position
+    float coeff = (1.0f - a_t) / sqrt(1.0f - a_bar_t + 1e-6f);
+    float3 x_next = (1.0f / sqrt(a_t + 1e-6f)) * (nodes[gid].pos - coeff * epsilon);
 
-    // HARD CLAMP: Absolute safety to prevent teleportation
-    if (length(final_update) > 0.03f) final_update = normalize(final_update) * 0.03f;
-
-    nodes[gid].pos += final_update;
-
-    for (uint i = 0; i < hidden_dim; i++) {
-        h[gid * hidden_dim + i] += h_update[gid * hidden_dim + i];
-    }
+    // 4. Update position
+    nodes[gid].pos = x_next;
 }

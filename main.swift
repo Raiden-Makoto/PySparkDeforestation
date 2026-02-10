@@ -105,6 +105,40 @@ var numNodes = 5 // Methane
 var numEdges = 8 // 4 bonds * 2
 let atomTypesCH4: [Int32] = [6, 1, 1, 1, 1]
 
+// DIFFUSION BUFFERS
+let alphasBuf = device.makeBuffer(length: 501 * 4, options: .storageModeShared)!
+let alphasCumprodBuf = device.makeBuffer(length: 501 * 4, options: .storageModeShared)!
+
+// --- Pre-compute the Schedule
+let timesteps = 500
+let betaStart: Float = 1e-4
+let betaEnd: Float = 0.02
+
+var alphas = [Float](repeating: 1.0, count: 501)
+var alphasCumprod = [Float](repeating: 1.0, count: 501)
+
+var currentCumprod: Float = 1.0
+for i in 1...timesteps {
+    let beta = betaStart + (betaEnd - betaStart) * (Float(i-1) / Float(timesteps - 1))
+    let alpha = 1.0 - beta
+    currentCumprod *= alpha
+    
+    alphas[i] = alpha
+    alphasCumprod[i] = currentCumprod
+}
+
+alphasBuf.contents().copyMemory(from: alphas, byteCount: 501 * 4)
+alphasCumprodBuf.contents().copyMemory(from: alphasCumprod, byteCount: 501 * 4)
+
+// check the schedule is correct
+let aPtr = alphasBuf.contents().bindMemory(to: Float.self, capacity: 501)
+let acPtr = alphasCumprodBuf.contents().bindMemory(to: Float.self, capacity: 501)
+print("Schedule Check")
+for checkT in [0, 1, 250, 500] {
+    print(String(format: "t=%3d | Alpha: %.6f | AlphaCumprod: %.6f", checkT, aPtr[checkT], acPtr[checkT]))
+}
+print(sectionBreak)
+
 // GRAPH BUFFERS
 let nodeBuf = device.makeBuffer(length: numNodes * MemoryLayout<Node>.stride, options: .storageModeShared)!
 let typeBuf = device.makeBuffer(length: numNodes * 4, options: .storageModeShared)!
@@ -135,8 +169,14 @@ let hUpdateBuf = device.makeBuffer(length: numNodes * hiddenDim * 4, options: .s
 // --- INITIALIZATION ---
 // Initialize Nodes with Noise
 var noiseNodes = [Node](repeating: Node(pos: .init(0,0,0), atomType: 0), count: numNodes)
+let initialSigma = Float(sqrt(1.0 - 0.006353)) // Scale noise to match t=500 training
 for i in 0..<numNodes {
-    noiseNodes[i] = Node(pos: SIMD3<Float>(Float.random(in: -1...1), Float.random(in: -1...1), Float.random(in: -1...1)), atomType: Float(atomTypesCH4[i]))
+    let randomPos = SIMD3<Float>(
+        Float.random(in: -1...1) * initialSigma,
+        Float.random(in: -1...1) * initialSigma,
+        Float.random(in: -1...1) * initialSigma
+    )
+    noiseNodes[i] = Node(pos: randomPos, atomType: Float(atomTypesCH4[i]))
 }
 nodeBuf.contents().copyMemory(from: noiseNodes, byteCount: numNodes * MemoryLayout<Node>.stride)
 typeBuf.contents().copyMemory(from: atomTypesCH4, byteCount: numNodes * 4)
@@ -153,7 +193,7 @@ var pipeline: [String: MTLComputePipelineState] = [:]
 let allKernels = [
     "embed_atoms", "inject_timestamp",
     "compute_message", "compute_displacement", "compute_node",
-    "aggregate", "apply_update",
+    "aggregate", "apply_diffusion",
     "force_zero_center",
     "linear_128x128", "linear_128x1" // The new robust kernels
 ]
@@ -323,13 +363,18 @@ for t in (1...500).reversed() {
         enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
         // E. UPDATE
-        enc.setComputePipelineState(pipeline["apply_update"]!)
-        enc.setBuffer(nodeBuf, offset: 0, index: 0); enc.setBuffer(hBuf, offset: 0, index: 1)
-        enc.setBuffer(hUpdateBuf, offset: 0, index: 2); enc.setBuffer(posAggBuf, offset: 0, index: 3)
-        enc.setBytes(&hDim, length: 4, index: 4); enc.setBytes(&nNodesU, length: 4, index: 5)
-        var currentT = Float(t)
-        enc.setBytes(&currentT, length: 4, index: 6) // Pass the time to the kernel
-        enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        enc.setComputePipelineState(pipeline["apply_diffusion"]!)
+        enc.setBuffer(nodeBuf, offset: 0, index: 0)
+        enc.setBuffer(alphasBuf, offset: 0, index: 1)
+        enc.setBuffer(alphasCumprodBuf, offset: 0, index: 2)
+        enc.setBuffer(posAggBuf, offset: 0, index: 3)
+        var tUint = UInt32(t)
+        enc.setBytes(&tUint, length: 4, index: 4)
+        enc.setBytes(&nNodesU, length: 4, index: 5)
+        enc.dispatchThreads(
+            MTLSize(width: numNodes, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
     }
 
     // --- CoG NORMALIZATION ---
@@ -362,9 +407,4 @@ for i in 0..<numNodes {
     print(String(format: "Node %d [%@]: (%7.4f, %7.4f, %7.4f)", i, name, p.x, p.y, p.z))
 }
 
-// Sanity Check: Center of Gravity calculation on CPU
-var sum = SIMD3<Float>(0, 0, 0)
-for i in 0..<numNodes { sum += pointer[i].pos }
-let avg = sum / Float(numNodes)
-print(String(format: "\nCalculated Centroid: (%7.4f, %7.4f, %7.4f)", avg.x, avg.y, avg.z))
 print(sectionBreak)
