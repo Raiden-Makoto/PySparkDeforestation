@@ -13,7 +13,7 @@ let sectionBreak = String(repeating: "=", count: 50)
 
 // --- CONFIGURATION ---
 let hiddenDim = 128
-let numLayers = 3
+let numLayers = 4
 let numTypes = 10
 
 // Hidden dimension from your PyTorch checkpoint
@@ -291,7 +291,7 @@ for t in (0...2499).reversed() {
     enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
     // --- EGNN LAYERS ---
-    for i in 0..<3 {
+    for i in 0..<numLayers {
         // A. MESSAGE MLP
         enc.setComputePipelineState(pipeline["compute_message"]!)
         enc.setBuffer(hBuf, offset: 0, index: 0); enc.setBuffer(nodeBuf, offset: 0, index: 1); enc.setBuffer(edgeBuf, offset: 0, index: 2)
