@@ -59,6 +59,7 @@ kernel void compute_displacement(
     uint base = gid * 3;
 
     float scalar = coord_scalar[gid];
+    scalar = clamp(scalar, -7.0f, 7.0f);
 
     int i = edge_index[gid].x;
     int j = edge_index[gid].y;
@@ -68,7 +69,7 @@ kernel void compute_displacement(
     
     // 3. Calculate relative displacement
     float3 diff = pos_i - pos_j;
-    float dist = length(diff) + 1e-6f;
+    float dist = length(diff) + 0.1f;
     
     // 4. Use unit direction so the force doesn't scale with the 17,000Å gap
     float3 unit_direction = diff / dist;
