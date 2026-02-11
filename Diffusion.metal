@@ -33,10 +33,11 @@ kernel void apply_diffusion(
     
     // 3. DDPM Reverse Step: x_{t-1} calculation
     float coeff = (1.0f - a_t) / (sqrt(1.0f - a_bar_t) + 1e-7f);
+    float damping = 0.80f;
     
     // x_next = (1 / sqrt(a_t)) * (x_t - coeff * epsilon)
     // Note: We use x_t here, NOT pos_final.
-    float3 x_next = (1.0f / sqrt(a_t + 1e-7f)) * (x_t - (coeff * epsilon));
+    float3 x_next = (1.0f / sqrt(a_t + 1e-7f)) * (x_t - (damping * coeff * epsilon));
 
     // 4. Update the Node position for the next timestep
     nodes[gid].pos = x_next;
