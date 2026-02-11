@@ -26,7 +26,7 @@ kernel void compute_message(
     
     // Calculate Radial Invariant: squared distance + epsilon
     float3 diff = nodes[i].pos - nodes[j].pos;
-    float radial = min(dot(diff, diff), 2500.0f) + 1e-8f;
+    float radial = min(dot(diff, diff), 4761.0f) + 1e-8f;
 
     for (uint row = 0; row < hidden_dim; row++) {
         float acc = bias[row];
@@ -59,7 +59,7 @@ kernel void compute_displacement(
     uint base = gid * 3;
 
     // 2. Clamp the scalar to a reasonable range to prevent the Galaxy Exit
-    float scalar = clamp(coord_scalar[gid], -1.03f, 1.03f);
+    float scalar = clamp(coord_scalar[gid], -303.0f, 303.0f);
 
     int i = edge_index[gid].x;
     int j = edge_index[gid].y;

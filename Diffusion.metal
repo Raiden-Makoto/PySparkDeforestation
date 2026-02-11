@@ -36,7 +36,7 @@ kernel void apply_diffusion(
     
     // x_next = (1 / sqrt(a_t)) * (x_t - coeff * epsilon)
     // Note: We use x_t here, NOT pos_final.
-    float3 x_next = (1.0f / sqrt(a_t + 1e-7f)) * (x_t + (coeff * epsilon));
+    float3 x_next = (1.0f / sqrt(a_t + 1e-7f)) * (x_t - (coeff * epsilon));
 
     // 4. Update the Node position for the next timestep
     nodes[gid].pos = x_next;

@@ -107,20 +107,20 @@ var numEdges = 8 // 4 bonds * 2
 let atomTypesCH4: [Int32] = [6, 1, 1, 1, 1]
 
 // DIFFUSION BUFFERS
-let alphasBuf = device.makeBuffer(length: 500 * 4, options: .storageModeShared)!
-let alphasCumprodBuf = device.makeBuffer(length: 500 * 4, options: .storageModeShared)!
+let alphasBuf = device.makeBuffer(length: 2500 * 4, options: .storageModeShared)!
+let alphasCumprodBuf = device.makeBuffer(length: 2500 * 4, options: .storageModeShared)!
 
 // --- Pre-compute the Schedule
-let timesteps = 500
+let timesteps = 2500
 let betaStart: Float = 1e-4
 let betaEnd: Float = 0.02
 
-var alphas = [Float](repeating: 1.0, count: 500)
-var alphasCumprod = [Float](repeating: 1.0, count: 500)
+var alphas = [Float](repeating: 1.0, count: 2500)
+var alphasCumprod = [Float](repeating: 1.0, count: 2500)
 
 var currentCumprod: Float = 1.0
 for i in 0..<timesteps {
-    let beta = betaStart + (betaEnd - betaStart) * (Float(i-1) / Float(timesteps - 1))
+    let beta = betaStart + (betaEnd - betaStart) * (Float(i) / Float(timesteps - 1))
     let alpha = 1.0 - beta
     currentCumprod *= alpha
     
@@ -128,8 +128,8 @@ for i in 0..<timesteps {
     alphasCumprod[i] = currentCumprod
 }
 
-alphasBuf.contents().copyMemory(from: alphas, byteCount: 500 * 4)
-alphasCumprodBuf.contents().copyMemory(from: alphasCumprod, byteCount: 500 * 4)
+alphasBuf.contents().copyMemory(from: alphas, byteCount: 2500 * 4)
+alphasCumprodBuf.contents().copyMemory(from: alphasCumprod, byteCount: 2500 * 4)
 
 // GRAPH BUFFERS
 let nodeBuf = device.makeBuffer(length: numNodes * MemoryLayout<Node>.stride, options: .storageModeShared)!
@@ -162,7 +162,7 @@ let hUpdateBuf = device.makeBuffer(length: numNodes * hiddenDim * 4, options: .s
 // --- INITIALIZATION ---
 // Initialize Nodes with Noise
 var noiseNodes = [Node](repeating: Node(pos: .init(0,0,0), atomType: 0), count: numNodes)
-let initialSigma = Float(sqrt(1.0 - 0.006353)) // Scale noise to match t=500 training
+let initialSigma = Float(1.0)
 for i in 0..<numNodes {
     let randomPos = SIMD3<Float>(
         Float.random(in: -1...1) * initialSigma,
@@ -199,7 +199,7 @@ for name in allKernels {
 print("Buffers & Pipelines Ready.")
 print(sectionBreak)
 
-// --- DIFFUSION LOOP ---
+// --- DIFFUSION LOOP --
 let halfDim = hiddenDim / 2
 let exponentBase = log(10000.0) / Float(halfDim - 1)
 
@@ -210,7 +210,7 @@ var oneItem: UInt32 = 1
 var nEdgesU = UInt32(numEdges)
 var nNodesU = UInt32(numNodes)
 
-print("STARTING DIFFUSION LOOP (500 -> 1)")
+print("STARTING DIFFUSION LOOP (2500 -> 1)")
 
 let initCB = commandQueue.makeCommandBuffer()!
 let initEnc = initCB.makeComputeCommandEncoder()!
@@ -233,7 +233,7 @@ blitInit.endEncoding()
 copyCB.commit()
 copyCB.waitUntilCompleted()
 
-for t in (0...499).reversed() {
+for t in (0...2499).reversed() {
     let currentT = Float(t)
     let resetCB = commandQueue.makeCommandBuffer()!
     let blit = resetCB.makeBlitCommandEncoder()!
@@ -306,7 +306,8 @@ for t in (0...499).reversed() {
         enc.setBuffer(weights["layers.\(i).message_mlp.2.weight"]!, offset: 0, index: 1)
         enc.setBuffer(weights["layers.\(i).message_mlp.2.bias"]!, offset: 0, index: 2)
         enc.setBuffer(msgBuf, offset: 0, index: 3) // Stage 2 -> MsgBuf
-        enc.setBytes(&nEdgesU, length: 4, index: 4); enc.setBytes(&skipSiLU, length: 4, index: 5)
+        enc.setBytes(&nEdgesU, length: 4, index: 4);
+        enc.setBytes(&doSiLU, length: 4, index: 5)
         enc.dispatchThreads(MTLSize(width: numEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
         
         // B. COORDINATE MLP
@@ -345,6 +346,7 @@ for t in (0...499).reversed() {
         
         // D. INTERMEDIATE POSITION UPDATE
         // Mimics: pos = pos + displacement (inside the PyTorch layer)
+        
         enc.setComputePipelineState(pipeline["layer_pos_update"]!)
         enc.setBuffer(nodeBuf, offset: 0, index: 0)
         enc.setBuffer(posAggBuf, offset: 0, index: 1)
