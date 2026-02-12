@@ -160,7 +160,7 @@ let timeElapsed = clock.measure {
     // --- INITIALIZATION ---
     // Initialize Nodes with Noise
     var noiseNodes = [Node](repeating: Node(pos: .init(0,0,0), atomType: 0), count: numNodes)
-    let initialSigma = Float(0.96)
+    let initialSigma = Float(1.67)
     for i in 0..<numNodes {
         let randomPos = SIMD3<Float>(
             Float.random(in: -1...1) * initialSigma,
@@ -290,6 +290,26 @@ let timeElapsed = clock.measure {
         
         // --- EGNN LAYERS ---
         for i in 0..<numLayers {
+            // Z. ZERO AGGREGATORS FOR NEXT LAYER (Using same 'enc')
+            // must clear the buffers per layer not per timestep
+            enc.setComputePipelineState(pipeline["clear_buffer_float"]!)
+            
+            // Clear posAggBuf (3 floats per node)
+            enc.setBuffer(posAggBuf, offset: 0, index: 0)
+            var pCount = nNodesU * 3
+            enc.setBytes(&pCount, length: 4, index: 1)
+            enc.dispatchThreads(MTLSize(width: Int(pCount), height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            
+            // Clear msgAggBuf (hDim floats per node)
+            enc.setBuffer(msgAggBuf, offset: 0, index: 0)
+            var mCount = nNodesU * hDim
+            enc.setBytes(&mCount, length: 4, index: 1)
+            enc.dispatchThreads(MTLSize(width: Int(mCount), height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            
+            enc.memoryBarrier(scope: .buffers)
+            
             // A. MESSAGE MLP
             enc.setComputePipelineState(pipeline["compute_message"]!)
             enc.setBuffer(hBuf, offset: 0, index: 0); enc.setBuffer(nodeBuf, offset: 0, index: 1); enc.setBuffer(edgeBuf, offset: 0, index: 2)
@@ -393,47 +413,24 @@ let timeElapsed = clock.measure {
         
         enc.memoryBarrier(scope: .buffers)
         
-        // 7. ZERO AGGREGATORS FOR NEXT LAYER (Using same 'enc')
-        // This is the "Compute-style" memset.
-        enc.setComputePipelineState(pipeline["clear_buffer_float"]!)
-        
-        // Clear posAggBuf (3 floats per node)
-        enc.setBuffer(posAggBuf, offset: 0, index: 0)
-        var pCount = nNodesU * 3
-        enc.setBytes(&pCount, length: 4, index: 1)
-        enc.dispatchThreads(MTLSize(width: Int(pCount), height: 1, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-        
-        // Clear msgAggBuf (hDim floats per node)
-        enc.setBuffer(msgAggBuf, offset: 0, index: 0)
-        var mCount = nNodesU * hDim
-        enc.setBytes(&mCount, length: 4, index: 1)
-        enc.dispatchThreads(MTLSize(width: Int(mCount), height: 1, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-        
-        enc.memoryBarrier(scope: .buffers)
-        
         enc.endEncoding()
         stepCB.commit()
         stepCB.waitUntilCompleted()
-        Thread.sleep(forTimeInterval: 0.1)
+        if (t % 100 == 0){
+            let pointer = nodeBuf.contents().bindMemory(to: Node.self, capacity: numNodes)
+            // Iterate and print each node's position
+            for i in 0..<numNodes {
+                let node = pointer[i]
+                let p = node.pos
+                let type = Int(node.atomType)
+                // Format for easy reading: "Atom [Type]: (x, y, z)"
+                let name = (type == 6) ? "Carbon" : "Hydrogen"
+                print(String(format: "Node %d [%@]: (%7.4f, %7.4f, %7.4f)", i, name, p.x, p.y, p.z))
+            }
+        }
     }
     
     print(sectionBreak)
     print("Generation Complete.")
-    // Access the raw pointer from the GPU buffer
-    let pointer = nodeBuf.contents().bindMemory(to: Node.self, capacity: numNodes)
-    
-    // Iterate and print each node's position
-    for i in 0..<numNodes {
-        let node = pointer[i]
-        let p = node.pos
-        let type = Int(node.atomType)
-        // Format for easy reading: "Atom [Type]: (x, y, z)"
-        let name = (type == 6) ? "Carbon" : "Hydrogen"
-        print(String(format: "Node %d [%@]: (%7.4f, %7.4f, %7.4f)", i, name, p.x, p.y, p.z))
-    }
-    
-    print(sectionBreak)
 }
 print("Total runtime: \((timeElapsed).formatted(.time(pattern: .minuteSecond)))")
