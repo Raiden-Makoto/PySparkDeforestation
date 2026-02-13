@@ -34,12 +34,15 @@ float2 box_muller(device pcg32_random_t* rng) {
     return float2(r * cos(theta), r * sin(theta));
 }
 
+// Diffusion.metal
+//
+
 kernel void apply_diffusion(
     device Node* nodes               [[buffer(0)]],
     device const float* alphas       [[buffer(1)]],
     device const float* alphas_cp    [[buffer(2)]],
     device const float* pos_agg      [[buffer(3)]],
-    device pcg32_random_t* rng_state [[buffer(6)]], // State persists across timesteps
+    device pcg32_random_t* rng_state [[buffer(6)]],
     constant uint& current_t         [[buffer(4)]],
     constant uint& num_nodes         [[buffer(5)]],
     uint gid [[thread_position_in_grid]])
@@ -50,25 +53,41 @@ kernel void apply_diffusion(
     float a_bar_t = alphas_cp[current_t];
     float3 x_t = nodes[gid].pos;
     
+    // 1. Calculate Standard Forces
     uint base = gid * 3;
     float3 epsilon = float3(pos_agg[base], pos_agg[base + 1], pos_agg[base + 2]);
-    
-    // 1. Calculate Mean (mu)
     float coeff = (1.0f - a_t) / (sqrt(1.0f - a_bar_t) + 1e-7f);
+    
+    // 2. Expansion Term (The "Pull")
     float3 mu = (1.0f / sqrt(a_t + 1e-7f)) * (x_t - (coeff * epsilon));
 
-    // 2. Add Stochastic Variance (sigma * z)
+    // 3. Adaptive Noise (Annealing)
+    // If we are in the final 500 steps, reduce noise to 50% to let it settle.
+    float noise_scale = (current_t < 500) ? 0.5f : 1.0f;
+    
     if (current_t > 0) {
-        // Standard DDPM variance: sigma^2 = (1 - alpha)
         float sigma_t = sqrt(1.0f - a_t);
-        
-        // Generate 3D Gaussian noise
         float2 z1 = box_muller(&rng_state[gid]);
         float2 z2 = box_muller(&rng_state[gid]);
         float3 noise_z = float3(z1.x, z1.y, z2.x);
         
-        mu += sigma_t * noise_z;
+        mu += sigma_t * noise_z * noise_scale;
     }
-    mu = clamp(mu, -2.5f, 2.5f);
+
+    // 4. THE VISE GRIP
+    float dist_sq = dot(mu, mu);
+    
+    // A. Pauli Push (Fixes Short Bonds)
+    // Increase repulsion to 0.85A (squared ~0.72)
+    if (dist_sq < 0.72f && dist_sq > 1e-6f) {
+        mu = normalize(mu) * 0.85f;
+    }
+    
+    // B. Containment Clamp (Fixes Long Bonds)
+    // If t < 500 (Refinement Phase), clamp tight to 1.2A.
+    // Otherwise, keep the standard 1.5A box.
+    float limit = (current_t < 500) ? 1.2f : 1.5f;
+    mu = clamp(mu, -limit, limit);
+
     nodes[gid].pos = mu;
 }
