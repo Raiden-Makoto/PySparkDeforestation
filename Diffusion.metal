@@ -65,7 +65,7 @@ kernel void apply_diffusion(
     // The model is pulling too hard. We scale the force down.
     // Try 0.5f first. If it's too big (> 1.09), increase this. If it collapses, decrease.
     // This calibrates the "Strength" of your neural network to match the schedule.
-    epsilon *= 0.5f;
+    epsilon *= 1.25;
 
     // Standard DDPM Math
     float coeff = (1.0f - a_t) / (sqrt(1.0f - a_bar_t) + 1e-7f);
@@ -73,22 +73,32 @@ kernel void apply_diffusion(
     // We KEEP the expansion term (1.0/sqrt) because that's the natural counter-force.
     float3 mu = (1.0f / sqrt(a_t + 1e-7f)) * (x_t - (coeff * epsilon));
 
-    // Langevin Noise (Thermal Pressure)
+    // 2. TEMPERATURE SCALING (The Stabilizer)
+    // Reduce random heat by 20% to help them settle.
+    // This is standard "Temperature Sampling".
+    float damping = 0.8f;
     if (current_t > 0) {
         float sigma_t = sqrt(1.0f - a_t);
         float2 z1 = box_muller(&rng_state[gid]);
         float2 z2 = box_muller(&rng_state[gid]);
         float3 noise_z = float3(z1.x, z1.y, z2.x);
-        
-        // No "noise_scale" hack. Pure thermal noise.
-        mu += sigma_t * noise_z;
+        mu += sigma_t * noise_z * damping;
     }
 
-    // NO CLAMPS. NO PAULI WALLS. Just Physics.
-    // We keep a safety "Event Horizon" just to prevent NaN explosions,
-    // but 4.0 is far away from the bond length.
-    if (dot(mu, mu) > 16.0f) {
-        mu = normalize(mu) * 4.0f;
+    // --- BOUNDARY CONDITIONS ---
+    float dist_sq = dot(mu, mu);
+
+    // A. COLLISION DETECTION
+    // Real atoms repel if d < 0.6A. This is Pauli Exclusion.
+    if (dist_sq < 0.36f && dist_sq > 1e-6f) {
+        mu = normalize(mu) * 0.6f;
+    }
+
+    // B. CONTAINMENT FIELD
+    // If an atom drifts > 2.0A, the simulation box pushes it back.
+    // We do NOT force it to 1.09. We just say "Stay in the box."
+    if (dist_sq > 4.0f) {
+        mu = normalize(mu) * 2.0f;
     }
 
     nodes[gid].pos = mu;
