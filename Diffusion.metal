@@ -65,7 +65,7 @@ kernel void apply_diffusion(
     // The model is pulling too hard. We scale the force down.
     // Try 0.5f first. If it's too big (> 1.09), increase this. If it collapses, decrease.
     // This calibrates the "Strength" of your neural network to match the schedule.
-    epsilon *= 1.25;
+    epsilon *= 0.63;
 
     // Standard DDPM Math
     float coeff = (1.0f - a_t) / (sqrt(1.0f - a_bar_t) + 1e-7f);
@@ -76,13 +76,17 @@ kernel void apply_diffusion(
     // 2. TEMPERATURE SCALING (The Stabilizer)
     // Reduce random heat by 20% to help them settle.
     // This is standard "Temperature Sampling".
-    float damping = 0.8f;
+    float noise_scale = 0.8f;
+    if (current_t < 500) {
+        noise_scale = 0.8f * (float(current_t) / 500.0f);
+    }
+    
     if (current_t > 0) {
         float sigma_t = sqrt(1.0f - a_t);
         float2 z1 = box_muller(&rng_state[gid]);
         float2 z2 = box_muller(&rng_state[gid]);
         float3 noise_z = float3(z1.x, z1.y, z2.x);
-        mu += sigma_t * noise_z * damping;
+        mu += sigma_t * noise_z * noise_scale;
     }
 
     // --- BOUNDARY CONDITIONS ---
@@ -90,8 +94,8 @@ kernel void apply_diffusion(
 
     // A. COLLISION DETECTION
     // Real atoms repel if d < 0.6A. This is Pauli Exclusion.
-    if (dist_sq < 0.36f && dist_sq > 1e-6f) {
-        mu = normalize(mu) * 0.6f;
+    if (dist_sq < 0.64f && dist_sq > 1e-6f) {
+        mu = normalize(mu) * 0.8f;
     }
 
     // B. CONTAINMENT FIELD
